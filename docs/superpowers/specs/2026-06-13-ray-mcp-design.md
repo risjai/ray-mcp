@@ -493,7 +493,25 @@ the SDK repo before approval. Confirmed:
 - The full deferred distribution set in §12, gated on demand.
 - Multi-cluster support, if demand emerges.
 
-## 15. Standing Commitments (eyes-open)
+## 15. Rejected Alternatives (decision rationale)
+
+Recorded so a reviewer can see *why* the chosen path won, not just what it is.
+
+| Area | Chosen | Rejected | Why rejected |
+|------|--------|----------|--------------|
+| Deployment | Self-hosted per-user | Hosted multi-tenant endpoint | Forces us to store/route other people's cluster creds, isolation, abuse, scaling — huge surface for v1; per-user inherits the user's own kube access with zero credential handling. |
+| Code structure | Layered hexagonal (A) | Flat tool-centric (B) | Guards/namespace-defaulting/diff logic would be copy-pasted across ~20 tools and drift; B can't be unit-tested without a cluster. |
+| Code structure | Layered hexagonal (A) | Generic kubectl-for-Ray passthrough (C) | Pushes all schema-correctness onto the agent; contradicts the typed-params soft moat; would just be a thin `kubectl`, not a Ray tool. |
+| Control plane | KubeRay CRDs + Ray API (co-core) | CRDs only | Loses live logs / runtime job status — i.e. loses the entire hard moat (§2). |
+| Control plane | KubeRay CRDs + Ray API (co-core) | Ray API only | Not k8s-native; we'd manage clusters some other way; needs network reach to every head node; contradicts the Go/k8s rationale. |
+| Long-running jobs | Async-over-sync (bounded wait + follow) | Block tool call until job terminal | A tool call / SPDY tunnel cannot be held open for a multi-hour job; fragile against client timeouts and head-pod restarts. |
+| K8s client | Typed KubeRay client | Dynamic/unstructured client | No compile-time validation of deeply-nested specs; error-prone hand-built field paths. |
+| Spec input | Curated params + gated `rawSpec` | Raw passthrough only | Agents get full KubeRay schemas wrong; poor for the "just hook up an agent" goal. |
+| Spec input | Curated params + gated `rawSpec` | Curated only (no escape hatch) | Blocks advanced specs (tolerations, volumes, sidecars) until each is typed; would push power users off the tool. |
+| Safety | Layered (flags + dryRun + protected + diff) | Trust RBAC alone | Published default could be over-permissioned; no dry-run/diff UX; too risky for a "hook any agent up" tool. |
+| HTTP auth (deferred) | Bearer + localhost default | Full OAuth 2.1 now | Overkill for self-hosted per-user v1; seam left for later. |
+
+## 16. Standing Commitments (eyes-open)
 
 - Publishing as OSS (#1) + version-pin discipline (#12) is a **maintenance
   commitment**: tracking KubeRay releases, issue triage, supporting user configs
