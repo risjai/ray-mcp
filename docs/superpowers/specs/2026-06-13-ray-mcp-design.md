@@ -281,6 +281,47 @@ return. There are no cross-call or multi-hour tunnels. On a mid-call SPDY failur
 (e.g. head pod rescheduled), re-open once and retry; if still unreachable, return
 gracefully per §10.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Agent
+    box ray-mcp
+        participant MCP as MCP Layer
+        participant Svc as JobService
+        participant PF as PortForwarder
+    end
+    participant K8s as Kubernetes<br>API
+    participant Ray as Ray Dashboard<br>(head :8265)
+
+    Agent->>+MCP: ray_job_submit(entrypoint, target, wait=true)
+    MCP->>+Svc: SubmitJobRequest (validated)
+    Note over Svc: mutation gate.<br>build typed RayJob<br>(curated over rawSpec)
+    Svc->>+K8s: Create RayJob (ray.io/v1)
+    K8s-->>-Svc: accepted (name)
+
+    opt wait=true (bounded by waitTimeout, default 120s)
+        Svc->>+K8s: read RayJob.status.jobId + dashboardURL
+        K8s-->>-Svc: submission id + head svc
+        Svc->>+PF: Open(headSvc, 8265)
+        PF->>K8s: SPDY portforward
+        PF-->>-Svc: ephemeral local port
+        loop until terminal or waitTimeout
+            Svc->>+Ray: GET /api/jobs/{submission_id}
+            Ray-->>-Svc: jobStatus
+        end
+        PF->>PF: close tunnel (per-call)
+    end
+
+    alt terminal within cap
+        Svc-->>MCP: status = SUCCEEDED / FAILED
+    else still running at cap
+        Svc-->>-MCP: state=running + "call ray_job_get to continue"
+    end
+    MCP-->>-Agent: bounded result (no multi-hour block)
+
+    Note over Agent,Ray: For long jobs the agent polls ray_job_get.<br>Each call opens and closes its own tunnel.
+```
+
 ### B) `ray_job_logs` (the wedge, dashboard API path)
 1. `JobService.Logs`: resolve RayJob → submission id (`status.jobId`) + head
    service via KubeRay client.
