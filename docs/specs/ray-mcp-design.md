@@ -137,13 +137,13 @@ use. Distribution polish (§12) is justified by, and sequenced after, the wedge.
 | 6 | Scope | Single cluster (one context); **two namespace modes** (Q12): namespaced (default, Role+RoleBinding per ns) or cluster (`--allow-all-namespaces` → ClusterRole, opt-in). Flag↔RBAC reconciled at boot via SelfSubjectAccessReview | yes |
 | 7 | HTTP auth | **Non-loopback bind ⇒ token mandatory, no bypass** (Q8; `--insecure` killed). Default bind `127.0.0.1`. Static bearer (default) + K8s **TokenReview** (opt-in, built in v1). TLS to ingress/mesh. Audit-log every mutation | yes |
 | 8 | K8s client | controller-runtime **client package** (`pkg/client`, uncached, direct-to-API) + KubeRay Go types/scheme (`ray-operator/apis/ray/v1`); SSA (`client.Apply`) + `DryRunAll`. NOT the manager framework, NOT the generated clientset (Q3) | yes |
-| 9 | MCP SDK | Official `github.com/modelcontextprotocol/go-sdk` (**GA, v1.x**; stdio + streamable-HTTP transports) | yes |
+| 9 | MCP SDK | Official `github.com/modelcontextprotocol/go-sdk` (**GA v1.6.1, verified**; stdio + streamable-HTTP, tool annotations, structuredContent, in-memory test transport all present — §13/§14) | yes |
 | 10 | Spec input | Curated typed params + `rawSpec` escape hatch via **RFC 7386 JSON Merge Patch, rawSpec-over-curated (rawSpec wins)**, arrays replace wholesale, identity-guarded, applied **unstructured**; `--allow-raw-spec` gate (Q5) | yes |
 | 11 | Safety model | Layered: tier flags + MCP tool annotations + dryRun(default false) + **confirm-fingerprint on destructive tier** + self-gating `protected` annotation + diffs + RBAC floor (Q9/Q10) | yes |
 | 12 | KubeRay version | `ray.io/v1` only (no v1alpha1); compile against latest GA KubeRay at first commit (v1.5.x as of 2026-06), bump deliberately; **read the installed Ray CRD schema** for pruning prediction + best-effort version; CI-tested range in README (Q4) | yes |
 | 13 | Logs | Bounded tail (last-N-lines / since-duration), not streaming | yes |
 | 14 | Mutation interaction (Q9) | MCP annotations on every tool; `dryRun` defaults **false** for writes (server still dry-runs+diffs internally); **confirm-fingerprint two-step on destructive ops only** | yes |
-| 15 | Long-running ops (Q11) | Non-blocking by default; bounded `ray_job_wait` (≤120s, `until=running\|terminal`); wedge = **status distillation** ("stuck: no GPU nodes"), not server-side polling | yes |
+| 15 | Long-running ops (Q11) | Non-blocking by default; bounded `ray_job_wait` (≤30s, `until=running\|terminal`); wedge = **status distillation** ("stuck: no GPU nodes"), not server-side polling | yes |
 
 ## 5. Architecture
 
@@ -185,6 +185,10 @@ it depends on Go interfaces — which makes it unit-testable with fakes.
   concrete clients. Fakes drive the bulk of the tests.
 - **Transport and SDK are edges.** v1 ships **both** stdio (primary) and
   streamable HTTP (Q7); the domain/adapters are identical across transports.
+- **Logging is stderr/file only — never stdout (stdio-mode invariant).** In stdio
+  transport, **stdout *is* the MCP JSON-RPC wire**; the structured log and mutation
+  audit log must write to stderr (or a file), never stdout, or they corrupt the
+  protocol stream and break the session.
 - **The dashboard/Job API is read-only by construction (Q6).** `RayAPIPort` has
   **no write methods** — live status + logs only. Every mutation goes through the
   guarded CRD path, so the unauthenticated Ray dashboard (ShadowRay RCE surface)
@@ -247,7 +251,7 @@ default namespace. Tools marked ★ depend on the wedge (dashboard API + tunnel)
 | `ray_job_list` | read | List RayJobs (+ deployment/job status) |
 | `ray_job_get` | read ★ | **Distilled, agent-actionable** status (Q11): phase, progressing-vs-wedged (e.g. "Pending: unschedulable, no GPU nodes" + pod event), terminal exit + logs pointer — not raw `.status` |
 | `ray_job_logs` | read ★ | Bounded tail of job logs via Ray Job API (over tunnel) |
-| `ray_job_wait` | read | **Bounded** wait (≤120s, well under client timeout) `until=running\|terminal`; returns current status + `reached` bool. Default `until=running` (Q11) |
+| `ray_job_wait` | read | **Bounded** wait (≤30s, well under a typical ~60s client timeout) `until=running\|terminal`; returns current status + `reached` bool. Default `until=running` (Q11) |
 | `ray_job_submit` | write ★ | entrypoint + runtimeEnv + cluster target (see below); **non-blocking** — returns `{name, jobId-when-available, initialStatus}` immediately (Q11); `dryRun`. Creates a RayJob *CRD* (guarded CRD path) — not a Ray-side write |
 | `ray_job_delete` | destructive | Delete the RayJob resource (**confirm-fingerprint**, Q9) |
 
@@ -268,19 +272,22 @@ not yet populated (job not scheduled yet), wedge tools return a clear "job not y
 scheduled" message rather than a tunnel/connection error. The agent never has to
 know the submission id exists.
 
-**Cluster target (R8 — resolved: both modes, explicit and mutually exclusive).**
-A RayJob either runs against an existing cluster or brings its own. `ray_job_submit`
-takes exactly one of:
-- `targetCluster: <name>` — run against an **existing** RayCluster (maps to the
+**Cluster target (Q16 — the two-mode *schema* is ratified; the open sub-questions
+are scoped in §14).** A RayJob either runs against an existing cluster or brings
+its own. `ray_job_submit` takes exactly one of:
+- `existingCluster: <name>` — run against an **existing** RayCluster (maps to the
   RayJob `spec.clusterSelector`); no cluster is created or deleted by the job.
 - `clusterSpec: {curated params + rawSpec}` — maps to RayJob
   `spec.rayClusterSpec`; KubeRay creates an **ephemeral** cluster for the job and
-  tears it down on completion via `spec.shutdownAfterJobFinishes=true`.
+  (with `spec.shutdownAfterJobFinishes=true`) tears it down on completion.
 
 Supplying both, or neither, is a validation error. Because `clusterSpec` *creates
 a cluster* via a "submit job" call, it is gated behind `--allow-mutations` like any
 create, and the response states plainly that an ephemeral cluster will be / was
-created.
+created. **Still open (§14):** the *delete blast-radius* tiering (should deleting
+an ephemeral-mode job that cascade-deletes its cluster require `--allow-destructive`
++ confirm-fingerprint?) and the **`shutdownAfterJobFinishes` default** (KubeRay's
+own default is `false`).
 
 ### RayService
 | Tool | Tier | Purpose |
@@ -321,8 +328,9 @@ in-server field policy (§8).
 
 ### A) `ray_job_submit` → follow (the wedge, cross-plane, non-blocking — Q11)
 
-MCP tool calls are request/response with a client timeout (~tens of seconds); a
-Ray job runs minutes-to-hours. Blocking server-side to completion is a **trap**:
+MCP tool calls are request/response with a client timeout (commonly ~60s; some
+clients lower); a Ray job runs minutes-to-hours. Blocking server-side to
+completion is a **trap**:
 it times out on exactly the long jobs that matter, the call dies while the job
 keeps running, and the agent wrongly concludes failure. So submit is **never
 blocking**, and waiting is a *separate, bounded* tool.
@@ -333,9 +341,10 @@ blocking**, and waiting is a *separate, bounded* tool.
    `DryRunAll` → SSA-apply. **Returns immediately**: `{name, jobId (when
    available), initialStatus}`. Never blocks to completion.
 3. The agent **follows** via two read tools (no server-side long-poll):
-   - `ray_job_wait(name, waitSeconds≤120, until=running|terminal)` — a **bounded**
-     wait capped well under client timeouts; default `until=running` answers "did
-     it start, or is it stuck Pending?". Returns current status + a `reached` bool.
+   - `ray_job_wait(name, waitSeconds≤30, until=running|terminal)` — a **bounded**
+     wait capped well under a typical ~60s client timeout; default `until=running`
+     answers "did it start, or is it stuck Pending?". Returns current status + a
+     `reached` bool.
    - `ray_job_get(name)` — **distilled, agent-actionable** status: phase,
      progressing-vs-wedged ("Pending: unschedulable, no GPU nodes" + the pod
      event), terminal exit + a logs pointer. This *distillation* — handing the
@@ -343,6 +352,15 @@ blocking**, and waiting is a *separate, bounded* tool.
      part of the wedge differentiation (Q11).
 4. README documents the canonical agent loop: **submit → wait(running) → poll get
    → logs**. Tunnels used by `wait`/`get`/`logs` follow the pooled model below.
+
+**Two-phase wait/follow (C1).** `status.jobId` (the submission id) is populated by
+KubeRay **asynchronously** after submit — it is empty until the submitter is
+scheduled. So every wedge read is two-phase: **(phase 1)** poll the **RayJob CRD**
+until `status.jobId` is populated; **(phase 2)** only then dial the dashboard and
+poll `GET /api/jobs/{jobId}`. While `status.jobId` is empty, wedge tools return a
+clear "job not yet scheduled" status (not a tunnel/connection error). A
+`wait(until=running)` issued immediately after submit spends phase 1 entirely on
+the CRD.
 
 **Tunnel lifecycle (Q6):** reachability is resolved via the `RayReachability`
 strategy — `DirectDial` when in-cluster (no tunnel at all), `PortForward` (SPDY)
@@ -376,13 +394,16 @@ sequenceDiagram
 
     Note over Agent,Ray: Agent follows the job with bounded reads — never a server-side long-poll.
 
-    Agent->>+MCP: ray_job_wait(name, waitSeconds<=120, until=running)
+    Agent->>+MCP: ray_job_wait(name, waitSeconds<=30, until=running)
     MCP->>+Svc: wait request
+    Note over Svc,K8s: phase 1 — poll CRD until<br>status.jobId is populated
+    Svc->>+K8s: GET RayJob status
+    K8s-->>-Svc: status.jobId (once scheduled)
     Svc->>+Reach: Endpoint(ns, cluster, 8265)
     Note over Reach: DirectDial in-cluster,<br>else reuse/open pooled<br>SPDY tunnel
     Reach-->>-Svc: dashboard endpoint (warm)
-    loop until reached or waitSeconds cap
-        Svc->>+Ray: GET /api/jobs/{submission_id}
+    loop phase 2 — until reached or waitSeconds cap
+        Svc->>+Ray: GET /api/jobs/{jobId}
         Ray-->>-Svc: jobStatus
     end
     Svc-->>-MCP: {status, reached: bool}
@@ -390,7 +411,7 @@ sequenceDiagram
 
     Agent->>+MCP: ray_job_get(name)  %% distilled status
     MCP->>+Svc: get
-    Svc->>+Ray: GET /api/jobs/{submission_id}
+    Svc->>+Ray: GET /api/jobs/{jobId}
     Ray-->>-Svc: raw status
     Note over Svc: distill: phase,<br>progressing-vs-wedged,<br>exit + logs pointer
     Svc-->>-MCP: distilled status
@@ -401,11 +422,14 @@ sequenceDiagram
 
 ### B) `ray_job_logs` (the wedge, dashboard API path — read-only)
 1. `JobService.Logs`: resolve RayJob → submission id (`status.jobId`) + head
-   service via KubeRay client.
+   endpoint via the KubeRay client, reading the head address from **RayJob/cluster
+   status** (`status.dashboardURL` / `status.rayClusterName` → head service), **not
+   a string-templated DNS guess** — KubeRay's head-service naming has
+   version-dependent suffixes and RayService cluster names are generated. (C2)
 2. `RayReachability.Endpoint(ns, cluster, 8265)` → either a direct in-cluster URL
    (`DirectDial`) or a pooled SPDY tunnel (`PortForward`). (8265 is the dashboard
    / Job Submission REST API port.) The endpoint is reused from the pool if warm.
-3. `RayAPIClient.JobLogs(submissionID)` → `GET /api/jobs/{submission_id}/logs` →
+3. `RayAPIClient.JobLogs(jobID)` → `GET /api/jobs/{jobId}/logs` →
    bounded tail → text. The client exposes **only read endpoints** —
    `GET /api/jobs/{id}` (status) and `.../logs` — no submit/stop methods exist on
    `RayAPIPort` (Q6); job creation happens on the CRD path, not here.
@@ -679,8 +703,13 @@ the SDK repo. Confirmed:
   `POST /api/jobs/` (submit), `GET /api/jobs/{id}` (status),
   `GET /api/jobs/{id}/logs` (logs), `POST /api/jobs/{id}/stop`. The `{id}` is the
   **submission id** (`raysubmit_...`).
-- **`RayJob.status`** (`ray.io/v1`) exposes `jobId` (== submission id; no separate
-  `submissionId` field), `dashboardURL`, `jobStatus`, `jobDeploymentStatus`.
+- **`RayJob.status`** (`ray.io/v1`) exposes `jobId` (== submission id; **no
+  separate `submissionId` field** — verified), `rayClusterName`, `dashboardURL`,
+  `jobStatus`, `jobDeploymentStatus`, `reason`, `message`, `startTime`, `endTime`,
+  `succeeded`, `failed`, `rayClusterStatus`, `observedGeneration`, `rayJobInfo`.
+  **Codegen caveat:** `jobId` *also* exists as an optional **`spec.jobId`**
+  (user-supplied submission id; KubeRay generates one if empty) — model it in both
+  spec and status, not status-only.
 - **RayJob targeting:** `spec.clusterSelector` (existing cluster) vs
   `spec.rayClusterSpec` (ephemeral) + `spec.shutdownAfterJobFinishes`.
   (`submissionMode` defaults to `K8sJobMode`.)
@@ -721,33 +750,33 @@ the SDK repo. Confirmed:
 
 ## 14. Open Questions / Future Work
 
-**⏳ Q16 — `ray_job_submit` ephemeral vs. existing cluster (RAISED, NOT DECIDED —
-needs user sign-off before implementation).** A KubeRay RayJob runs in two modes:
-**ephemeral** (`spec.rayClusterSpec` — the job creates its own RayCluster and, if
-`shutdownAfterJobFinishes=true`, tears it down) or **existing-cluster**
-(`spec.clusterSelector` — submits to a running RayCluster, never touches its
-lifecycle). This matters because:
-- **`ray_job_delete` blast radius is mode-dependent** — deleting an *ephemeral*
-  job can cascade-delete a whole RayCluster (and every other job/actor on it),
-  whereas deleting an *existing-cluster* job just removes the record. Q9/Q14
-  currently treat `ray_job_delete` as one uniform destructive op.
-- **`shutdownAfterJobFinishes` is an agent footgun**: default-off → orphaned
-  GPU-burning clusters (cost surprise); default-on → cluster gone before
-  post-mortem (lost debugging).
-- Leaning (pending decision): explicit `existingCluster:<name>` XOR
-  `clusterSpec:{curated + rawSpec}` (both/neither → error); make `ray_job_delete`
-  **mode-aware** (ephemeral-with-cascade → destructive tier + confirm-fingerprint;
-  existing-cluster → plain write); default `shutdownAfterJobFinishes=true` with a
-  "pass false to keep for debugging" hint. *Note:* §6 currently sketches a
-  `targetCluster`/`clusterSpec` split; Q16 would formalize it and add the
-  mode-aware-delete nuance. **Not yet ratified.**
+**⏳ Q16 — RayJob mode behavior (schema RATIFIED in §6; two sub-questions OPEN,
+need sign-off before implementation).** The submit *schema* is settled:
+`existingCluster:<name>` (→ `spec.clusterSelector`, existing cluster) XOR
+`clusterSpec:{curated + rawSpec}` (→ `spec.rayClusterSpec`, ephemeral cluster),
+both/neither → validation error (§6). What remains open is the *behavior* the two
+modes imply:
+- **(Q16a) `ray_job_delete` blast radius is mode-dependent** — deleting an
+  *ephemeral* job can cascade-delete a whole RayCluster (and every other job/actor
+  on it), whereas deleting an *existing-cluster* job just removes the record.
+  Q9/Q14 currently treat `ray_job_delete` as one uniform op. **Lean:** make it
+  **mode-aware** — ephemeral-with-cascade → destructive tier (`--allow-destructive`
+  + confirm-fingerprint); existing-cluster → plain write. (Couples to B3's
+  "destructive tier vs. disruptive op" vocabulary question.)
+- **(Q16b) `shutdownAfterJobFinishes` default.** KubeRay's own default is
+  **`false`** (verified) → orphaned GPU-burning clusters (cost surprise);
+  flipping to `true` risks the cluster being gone before post-mortem (lost
+  debugging). **Lean:** default `true` with a "pass `false` to keep for debugging"
+  hint surfaced in the result. **Not yet ratified.**
 
-**Open item inside a decided question:**
-- **Q15:** verify the official go-sdk supports MCP tool annotations
-  (`destructiveHint`/`readOnlyHint`/`idempotentHint`), `structuredContent` dual
-  output, and the in-memory transport — at implementation start. Reasoned from a
-  Jan-2026 cutoff, not yet verified; low-risk because the SDK is quarantined behind
-  `internal/mcp/`. If missing, it changes either the SDK choice or those decisions.
+**✅ Q15 open item — CLOSED (verified 2026-06-13).** The official go-sdk
+dependency was confirmed against primary sources: latest release **v1.6.1
+(2026-05-22)**, well past 1.0. All bet-on features exist by exact name —
+`ToolAnnotations{ReadOnlyHint, DestructiveHint *bool, IdempotentHint}` on
+`Tool.Annotations`, `CallToolResult.StructuredContent`, `StdioTransport`,
+`NewStreamableHTTPHandler`, typed `AddTool[In,Out]`, and `NewInMemoryTransports()`
+for tests. No SDK risk remains. (Attribution note: the repo bills itself "official
+… in collaboration with Google" — do not describe it as Anthropic-maintained.)
 
 **Not yet grilled (candidate future questions, from the grilling status summary):**
 - RayService zero-downtime **update** semantics — what the tool exposes and how
@@ -790,7 +819,7 @@ Recorded so a reviewer can see *why* the chosen path won, not just what it is.
 | Safety | Layered (flags + dryRun + protected + diff) | Trust RBAC alone | Published default could be over-permissioned; no dry-run/diff UX; too risky for a "hook any agent up" tool. |
 | Ray API reach (Q6) | Auto-detected strategy (direct vs port-forward) | Always port-forward (old #5) | In-cluster, port-forward is pointless overhead + needs extra `pods/portforward` RBAC; direct cluster-DNS dial is cleaner. |
 | Ray API writes (Q6) | Read-only by construction | Expose `ray_job_stop` via dashboard API | Dashboard API is unauthenticated/RCE-capable; a Ray-side write path is a liability. CRD `spec.suspend` is the safer route, deferred. |
-| Tunnel lifecycle (Q6) | Pooled per (ns,cluster) + idle reaper | Per-call open/close (old R1) | Per-call re-dial is wasteful for status/logs polling; pooling keeps the no-multi-hour-block guarantee while avoiding churn. |
+| Tunnel lifecycle (Q6) | Pooled per (ns,cluster) + idle reaper | Per-call open/close | Per-call re-dial is wasteful for status/logs polling; pooling keeps the no-multi-hour-block guarantee while avoiding churn. |
 | Transport scope (Q7) | Both stdio + HTTP in v1 | Defer HTTP+Helm to v1.1 | Guts the Helm chart's reason to exist, contradicts goal #5; the cheap part is plumbing and the costly part (auth) we design anyway. |
 | HTTP auth (Q8) | No-token only on loopback; token mandatory off-loopback; static + TokenReview | `--insecure` no-token mode | A tokenless network-reachable cluster-driver + autonomous agent is a loaded gun; remove the footgun entirely. |
 | HTTP auth (Q8) | TokenReview as the identity story | Full OAuth 2.1 now | TokenReview is the idiomatic, cheaper in-cluster realization; OAuth only if external-IdP demand appears. |
