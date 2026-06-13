@@ -56,8 +56,11 @@ amount of CRD access or prompt-engineering gets a generic tool there:
 - **Live runtime status.** Actor/task/resource detail surfaced by the dashboard
   that the CRD status never carries.
 
-This cross-plane path (RayAPI client + port-forwarder) is the **core
-differentiator**, not a secondary feature. The implementation must nail it.
+This cross-plane path (read-only RayAPI client + reachability strategy) is the
+**core differentiator**, not a secondary feature. The implementation must nail
+it. Note the dashboard/Job API is **unauthenticated and RCE-capable** (ShadowRay),
+so `ray-mcp` consumes it strictly read-only (Q6, §8) and reaches it via
+in-cluster DNS or an SPDY tunnel depending on where the server runs.
 
 ### Soft moat — a generic tool *can*, but agents get it wrong
 
@@ -100,34 +103,39 @@ use. Distribution polish (§12) is justified by, and sequenced after, the wedge.
 - Be trivial to "hook up": run locally against a kubeconfig (stdio) and drop
   into an agent's MCP config.
 - **Sequence wedge → polish.** The wedge and its tests land before heavy
-  distribution machinery (multi-arch, distroless, HTTP transport). *Cheap*
-  adoption hedges (Apache-2.0, KubeRay-native naming, an MCP-registry listing,
-  a donation-ready README) are not deferred — they cost little (§12/§16).
+  *release-engineering* machinery (multi-arch pipeline, distroless hardening).
+  *Cheap* adoption hedges (Apache-2.0, KubeRay-native naming, an MCP-registry
+  listing, a donation-ready README) are not deferred — they cost little
+  (§12/§16). Note (Q7): HTTP transport + Helm are **not** in the deferred bucket —
+  see Non-Goals and §12.
 
 ### Non-Goals (v1)
-- **HTTP transport, bearer auth, and in-cluster deployment** — deferred (see
-  §12). v1 is stdio-only. The transport seam is kept at the edge so HTTP can be
-  added without a refactor.
 - No hosted multi-tenant service; no storage of other users' cluster
-  credentials.
+  credentials. (HTTP transport in v1 is for a *self-hosted shared-team instance*,
+  Q7 — not a hosted service.)
+- **No Ray-side write surface.** The dashboard/Job REST API is consumed
+  **read-only** (live status + logs); every mutation goes through the guarded CRD
+  path (Q6). `ray_job_stop` is therefore **deferred from v1** (it was the only
+  Ray-side write candidate; the heavier CRD `spec.suspend` route is future work).
 - No multi-cluster fan-out (one server instance binds to one Kubernetes
   context).
 - No management of the KubeRay operator's own installation/lifecycle.
 - No true real-time log streaming (v1 returns a bounded tail).
 - No provisioning of the underlying Kubernetes cluster or node pools.
 - No in-server PodSecurity policy on `rawSpec` (delegated to RBAC + admission, §8).
+- No TLS termination inside the binary — pushed to ingress/mesh (Q8, §9).
 
 ## 4. Key Decisions
 
 | # | Decision | Choice | v1? |
 |---|----------|--------|-----|
 | 1 | Deployment model | Self-hosted, per-user; ambition = default OSS KubeRay MCP server (Q1) | yes (binary only) |
-| 2 | Transport | stdio; HTTP seam kept at edge but deferred | stdio only |
+| 2 | Transport | **Both stdio + streamable HTTP in v1** (Q7). stdio = primary/must-be-flawless (wedge-delivery, README quickstart); HTTP = secondary self-hosted shared-team instance, security designed-in not bolted-on | yes |
 | 3 | Control plane | KubeRay CRDs **and** Ray dashboard/job API as **co-core** (cross-plane path is the wedge) | yes |
 | 4 | Operation surface | Full lifecycle read+write, guarded (safe by default) | yes |
-| 5 | Ray API reach | Auto port-forward via the k8s API (SPDY), on demand — **core to the wedge** | yes |
+| 5 | Ray API reach | **Auto-detected reachability strategy** (Q6): DirectDial in-cluster vs SPDY PortForward out-of-cluster (`--ray-access=auto\|direct\|port-forward`). Dashboard/Job API consumed **read-only by construction**. Pooled tunnel per (ns,cluster) + idle reaper. **Core to the wedge** | yes |
 | 6 | Scope | Single cluster (one context), multi-namespace | yes |
-| 7 | HTTP auth | Bearer token; localhost default; refuse no-token unless `--insecure` | deferred (with HTTP) |
+| 7 | HTTP auth | **Non-loopback bind ⇒ token mandatory, no bypass** (Q8; `--insecure` killed). Default bind `127.0.0.1`. Static bearer (default) + K8s **TokenReview** (opt-in, built in v1). TLS to ingress/mesh. Audit-log every mutation | yes |
 | 8 | K8s client | controller-runtime **client package** (`pkg/client`, uncached, direct-to-API) + KubeRay Go types/scheme (`ray-operator/apis/ray/v1`); SSA (`client.Apply`) + `DryRunAll`. NOT the manager framework, NOT the generated clientset (Q3) | yes |
 | 9 | MCP SDK | Official `github.com/modelcontextprotocol/go-sdk` (**GA, v1.x**; stdio + streamable-HTTP transports) | yes |
 | 10 | Spec input | Curated typed params + `rawSpec` escape hatch via **RFC 7386 JSON Merge Patch, rawSpec-over-curated (rawSpec wins)**, arrays replace wholesale, identity-guarded, applied **unstructured**; `--allow-raw-spec` gate (Q5) | yes |
@@ -143,7 +151,7 @@ it depends on Go interfaces — which makes it unit-testable with fakes.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ Transport (edge)         stdio   [HTTP seam kept, not shipped] │
+│ Transport (edge)   stdio (primary)  │  streamable HTTP (+auth) │
 ├──────────────────────────────────────────────────────────────┤
 │ MCP layer  (modelcontextprotocol/go-sdk)                       │
 │   • tool registration + JSON schemas                           │
@@ -161,8 +169,9 @@ it depends on Go interfaces — which makes it unit-testable with fakes.
 │ Adapters (ports)                                               │
 │   ├─ KubeRayClient   (ctrl-runtime client pkg, uncached;       │
 │   │                   SSA + DryRunAll; reads Ray CRD schema)    │
-│   ├─ RayAPIClient    (dashboard/job REST over a tunnel) ★ wedge │
-│   └─ PortForwarder   (k8s SPDY portforward to head svc:8265) ★ │
+│   ├─ RayAPIClient    (dashboard/job REST, READ-ONLY) ★ wedge    │
+│   └─ RayReachability  ┬ DirectDial    (in-cluster DNS)   ★      │
+│                       └ PortForward   (SPDY, out-of-cluster) ★  │
 ├──────────────────────────────────────────────────────────────┤
 │ Kubernetes API server  +  Ray head dashboard (in-cluster)      │
 └──────────────────────────────────────────────────────────────┘
@@ -172,13 +181,21 @@ it depends on Go interfaces — which makes it unit-testable with fakes.
 ### Boundaries
 - **Domain depends on interfaces**, `KubeRayPort` and `RayAPIPort`, not on
   concrete clients. Fakes drive the bulk of the tests.
-- **Transport and SDK are edges.** v1 ships stdio; the transport seam is kept so
-  HTTP can be added later without touching domain or adapters.
+- **Transport and SDK are edges.** v1 ships **both** stdio (primary) and
+  streamable HTTP (Q7); the domain/adapters are identical across transports.
+- **The dashboard/Job API is read-only by construction (Q6).** `RayAPIPort` has
+  **no write methods** — live status + logs only. Every mutation goes through the
+  guarded CRD path, so the unauthenticated Ray dashboard (ShadowRay RCE surface)
+  is never a write vector through this tool.
 - **One instance = one Kubernetes context**, bound at startup; multi-namespace
   within that context.
-- **PortForwarder tunnels are per-call and ephemeral** (§7.A) — opened and closed
-  within a single tool invocation. No long-lived or cross-call shared tunnels, so
-  no tool call ever depends on a tunnel outliving it.
+- **Reachability is a strategy (Q6).** A `RayReachability` port with two adapters
+  — `DirectDial` (in-cluster, via cluster DNS, no `pods/portforward` RBAC) and
+  `PortForward` (SPDY, out-of-cluster) — selected by `--ray-access=auto|direct|
+  port-forward` (`auto` detects in-cluster config). Tunnels are **pooled per
+  (namespace, cluster) with an idle-timeout reaper** (not per-call), re-dialed on
+  next use if dropped. No tool call blocks on a tunnel for a job's lifetime
+  (§7.A), but tunnels are reused across calls within their idle window.
 - **KubeRayClient is the controller-runtime client package** (uncached,
   direct-to-API-server) — we are a client, not a controller: no
   cache/reconcile/leader-election/webhooks. All mutations go through **Server-Side
@@ -193,9 +210,9 @@ internal/mcp/                    # tool registration, schemas, arg↔DTO mapping
 internal/domain/                 # services, guards, apply pipeline (pure-ish)
   cluster.go  job.go  service.go  guards.go  apply.go  diff.go  types.go
 internal/adapters/kuberay/       # controller-runtime client impl (SSA + schema read)
-internal/adapters/rayapi/        # dashboard/job REST client    ★ wedge
-internal/adapters/portforward/   # SPDY tunnel manager          ★ wedge
-internal/observability/          # structured logging, optional metrics
+internal/adapters/rayapi/        # dashboard/job REST client (read-only) ★ wedge
+internal/adapters/reachability/  # DirectDial + PortForward strategies   ★ wedge
+internal/observability/          # structured logging + mutation audit log
 ```
 
 ## 6. Tool Surface
@@ -223,9 +240,14 @@ default namespace. Tools marked ★ depend on the wedge (dashboard API + tunnel)
 | `ray_job_list` | read | List RayJobs (+ deployment/job status) |
 | `ray_job_get` | read ★ | Status incl. live dashboard job status, start/end, message |
 | `ray_job_logs` | read ★ | Bounded tail of job logs via Ray Job API (over tunnel) |
-| `ray_job_submit` | write ★ | entrypoint + runtimeEnv + cluster target (see below); optional bounded `wait` (then follow via `ray_job_get`); `dryRun` |
-| `ray_job_stop` | write | Stop a running job |
+| `ray_job_submit` | write ★ | entrypoint + runtimeEnv + cluster target (see below); optional bounded `wait` (then follow via `ray_job_get`); `dryRun`. Creates a RayJob *CRD* (guarded CRD path) — not a Ray-side write |
 | `ray_job_delete` | destructive | Delete the RayJob resource |
+
+> **`ray_job_stop` is deferred from v1 (Q6).** It was the only Ray-side write
+> candidate, and v1 keeps the dashboard API read-only by construction. The
+> CRD-native alternative (`spec.suspend`, which can tear the cluster down) is
+> heavier and deferred rather than rushed. v1 RayJob surface: `list`/`get`/`logs`
+> (read) + `submit` (write, CRD) + `delete` (destructive).
 
 **Job identity.** The agent always refers to a job by its **RayJob k8s name**.
 The Ray dashboard/job REST API is keyed by the **submission id** (the
@@ -309,10 +331,14 @@ is best-effort, and the agent loops on `get` to follow long jobs.
    `ray_job_get`. Optional MCP progress notifications may be emitted during the
    bounded wait, but correctness never depends on the client handling them.
 
-**Tunnel lifecycle:** tunnels are **per-call and ephemeral** — opened at the start
-of a tool invocation, reused only within that one call's poll loop, closed on
-return. There are no cross-call or multi-hour tunnels. On a mid-call SPDY failure
-(e.g. head pod rescheduled), re-open once and retry; if still unreachable, return
+**Tunnel lifecycle (Q6):** reachability is resolved via the `RayReachability`
+strategy — `DirectDial` when in-cluster (no tunnel at all), `PortForward` (SPDY)
+when out-of-cluster. Tunnels are **pooled per (namespace, cluster) with an
+idle-timeout reaper**, reused across calls within the idle window and re-dialed on
+next use if dropped. Crucially, no tool call blocks on a tunnel for a *job's*
+lifetime — the bounded-wait loop above still returns fast; pooling only avoids
+re-establishing a tunnel on every status/logs call. On a mid-call failure
+(e.g. head pod rescheduled), re-dial once; if still unreachable, degrade
 gracefully per §10.
 
 ```mermaid
@@ -322,10 +348,10 @@ sequenceDiagram
     box ray-mcp
         participant MCP as MCP Layer
         participant Svc as JobService
-        participant PF as PortForwarder
+        participant Reach as RayReachability<br>(direct or pooled tunnel)
     end
     participant K8s as Kubernetes<br>API
-    participant Ray as Ray Dashboard<br>(head :8265)
+    participant Ray as Ray Dashboard<br>(head :8265, read-only)
 
     Agent->>+MCP: ray_job_submit(entrypoint, target, wait=true)
     MCP->>+Svc: SubmitJobRequest (validated)
@@ -336,14 +362,13 @@ sequenceDiagram
     opt wait=true (bounded by waitTimeout, default 120s)
         Svc->>+K8s: read RayJob.status.jobId + dashboardURL
         K8s-->>-Svc: submission id + head svc
-        Svc->>+PF: Open(headSvc, 8265)
-        PF->>K8s: SPDY portforward
-        PF-->>-Svc: ephemeral local port
+        Svc->>+Reach: Endpoint(ns, cluster, 8265)
+        Note over Reach: DirectDial in-cluster,<br>else reuse/open pooled<br>SPDY tunnel
+        Reach-->>-Svc: dashboard endpoint (warm)
         loop until terminal or waitTimeout
             Svc->>+Ray: GET /api/jobs/{submission_id}
             Ray-->>-Svc: jobStatus
         end
-        PF->>PF: close tunnel (per-call)
     end
 
     alt terminal within cap
@@ -353,18 +378,21 @@ sequenceDiagram
     end
     MCP-->>-Agent: bounded result (no multi-hour block)
 
-    Note over Agent,Ray: For long jobs the agent polls ray_job_get.<br>Each call opens and closes its own tunnel.
+    Note over Agent,Ray: For long jobs the agent polls ray_job_get.<br>Tunnel is pooled per (ns,cluster), reaped when idle.
 ```
 
-### B) `ray_job_logs` (the wedge, dashboard API path)
+### B) `ray_job_logs` (the wedge, dashboard API path — read-only)
 1. `JobService.Logs`: resolve RayJob → submission id (`status.jobId`) + head
    service via KubeRay client.
-2. `PortForwarder.Open(headSvc, 8265)` → ephemeral local port, scoped to this
-   single call. (8265 is the dashboard / Job Submission REST API port.)
-3. `RayAPIClient.JobLogs(submissionID)` → `GET /api/jobs/{submission_id}/logs`
-   over the tunnel → bounded tail → text. (Status path: `GET /api/jobs/{id}`;
-   submit: `POST /api/jobs/`; stop: `POST /api/jobs/{id}/stop`.)
-4. `defer` tunnel close — opened and closed within this one call.
+2. `RayReachability.Endpoint(ns, cluster, 8265)` → either a direct in-cluster URL
+   (`DirectDial`) or a pooled SPDY tunnel (`PortForward`). (8265 is the dashboard
+   / Job Submission REST API port.) The endpoint is reused from the pool if warm.
+3. `RayAPIClient.JobLogs(submissionID)` → `GET /api/jobs/{submission_id}/logs` →
+   bounded tail → text. The client exposes **only read endpoints** —
+   `GET /api/jobs/{id}` (status) and `.../logs` — no submit/stop methods exist on
+   `RayAPIPort` (Q6); job creation happens on the CRD path, not here.
+4. The pooled tunnel is left warm for the idle window (reaped later), not closed
+   per-call.
 
 ### C) The unified apply pipeline (shared by create / update / deploy) — Q5
 
@@ -420,6 +448,17 @@ Layered defense-in-depth; never relies on the agent behaving well.
   guarded accordingly (refuse-unless-forced + clear impact message).
 - **Before/after diff** returned by every successful mutation (structured +
   human-readable).
+- **Read-only dashboard invariant (Q6).** The Ray dashboard/Job API is
+  unauthenticated and RCE-capable (ShadowRay). `RayAPIPort` therefore exposes
+  **no write methods** — the tunnel can never be a mutation vector through this
+  tool; all writes are CRD-path, RBAC-gated.
+- **Audit log every mutating call (Q8).** Caller identity (static-token
+  fingerprint or TokenReview SA username), tool, args summary, `dryRun` flag, and
+  outcome — so "what did the agent do?" is always answerable. Not optional polish.
+- **The HTTP token gates *reach*, not *privilege* (Q8).** Once past the token the
+  server acts with its **own SA's RBAC**; that SA's RBAC is the real privilege
+  boundary. Scope it tightly; the token must be strong and is mandatory on any
+  non-loopback bind.
 - **`rawSpec` security boundary (Q5) — bounded by RBAC + admission, no in-server
   field policy.** `rawSpec` reaches the full PodTemplateSpec (privileged,
   hostPath, hostNetwork, serviceAccountName, arbitrary images). We deliberately do
@@ -441,23 +480,31 @@ Layered defense-in-depth; never relies on the agent behaving well.
 
 ## 9. Configuration
 
-Precedence: flags > environment > defaults. (HTTP-related flags are listed for
-the deferred transport but are not wired in v1.)
+Precedence: flags > environment > defaults. Both transports and their flags are
+wired in v1 (Q7/Q8).
 
 | Flag | Env | Default | Purpose | v1? |
 |------|-----|---------|---------|-----|
-| `--transport` | `RAY_MCP_TRANSPORT` | `stdio` | `stdio` (only value in v1) | yes |
+| `--transport` | `RAY_MCP_TRANSPORT` | `stdio` | `stdio` (primary) or `http` | yes |
 | `--context` | `RAY_MCP_CONTEXT` | current context | Kubeconfig context to bind | yes |
 | `--kubeconfig` | `KUBECONFIG` | discovery / in-cluster SA | Credentials source | yes |
 | `--default-namespace` | `RAY_MCP_NAMESPACE` | `default` | Namespace when a tool omits one | yes |
 | `--allow-all-namespaces` | `RAY_MCP_ALL_NS` | `false` | Permit cluster-wide list | yes |
+| `--ray-access` | `RAY_MCP_RAY_ACCESS` | `auto` | Reachability strategy: `auto`\|`direct`\|`port-forward` (Q6) | yes |
 | `--allow-mutations` | `RAY_MCP_ALLOW_MUTATIONS` | `false` | Register write tools | yes |
 | `--allow-destructive` | `RAY_MCP_ALLOW_DESTRUCTIVE` | `false` | Register destructive tools | yes |
 | `--allow-raw-spec` | `RAY_MCP_ALLOW_RAW_SPEC` | `true` | When `false`, drop `rawSpec` from all tool schemas (curated-only hard mode) | yes |
 | `--log-level` | `RAY_MCP_LOG_LEVEL` | `info` | Structured log level | yes |
-| `--http-addr` | `RAY_MCP_HTTP_ADDR` | `127.0.0.1:8765` | HTTP listen address | deferred |
-| `--auth-token` | `RAY_MCP_AUTH_TOKEN` | (none) | Bearer token; required unless `--insecure` | deferred |
-| `--insecure` | `RAY_MCP_INSECURE` | `false` | Allow HTTP with no token (dev only) | deferred |
+| `--http-addr` | `RAY_MCP_HTTP_ADDR` | `127.0.0.1:8765` | HTTP listen address (`http` transport) | yes |
+| `--auth-mode` | `RAY_MCP_AUTH_MODE` | `static` | HTTP auth: `static` bearer or `tokenreview` (K8s SA tokens, Q8) | yes |
+| `--auth-token` | `RAY_MCP_AUTH_TOKEN` | (none) | Static bearer token. **Mandatory for any non-loopback bind**; no bypass flag (Q8) | yes |
+| `--ray-dashboard-auth` | `RAY_MCP_RAY_DASH_AUTH` | (none) | Optional token/header passed through to a dashboard fronted by an auth proxy (off by default, Q6) | yes |
+
+**Bind/auth invariant (Q8):** binding to a **non-loopback** address requires an
+auth token (static) or `tokenreview` mode — the process **refuses to boot
+otherwise**, with an explanatory error. There is no `--insecure` escape hatch.
+The only tokenless case is a loopback bind, which the OS already gates. TLS is
+terminated at ingress/mesh, not in the binary.
 
 ## 10. Error Handling & Output Contract
 
@@ -499,9 +546,16 @@ bomb that degrades the agent.
   (apply an object with an unknown field, assert it is detected/dropped).
 - **Ray API adapter:** `httptest` server mimicking the dashboard/job API
   (status + logs) — directly exercises the wedge logic without a live head node.
+  Asserts `RayAPIPort` is **read-only** (no submit/stop methods exist; Q6).
+- **Reachability (Q6):** unit-test strategy selection (`auto` in-cluster→Direct,
+  else PortForward) and tunnel pooling/idle-reaping with a fake dialer.
+- **HTTP auth (Q8):** assert the **boot invariant** — non-loopback bind without a
+  token (static or tokenreview) refuses to start; loopback is allowed tokenless;
+  TokenReview path validated against a fake reviewer.
 - **MCP layer:** in-memory transport from go-sdk; assert tool schemas (including
-  `rawSpec` absent when `--allow-raw-spec=false`), arg validation, and end-to-end
-  tool calls against fakes.
+  `rawSpec` absent when `--allow-raw-spec=false`, and `ray_job_stop` absent), arg
+  validation, and end-to-end tool calls against fakes. Run across **both stdio and
+  HTTP** transports.
 - **Optional e2e:** kind + KubeRay smoke test behind a build tag / CI job.
 
 ## 12. Distribution
@@ -511,25 +565,31 @@ the **cheap adoption hedges** ship from day one because they cost little and bac
 the "become the default" ambition (Q1/Q2, §16).
 
 **v1 ships:**
-- A plain `go install` / `go build` binary.
-- README: stdio quickstart (point at kubeconfig, drop into an agent's MCP
-  config) plus the documented least-privilege RBAC (namespace `Role` + the small
+- A plain `go install` / `go build` binary, speaking **both** stdio and HTTP (Q7).
+- README: **stdio quickstart leads** (point at kubeconfig, drop into an agent's
+  MCP config) — the primary adoption path; a secondary "shared team instance"
+  section covers the HTTP transport, its mandatory-token invariant, and TLS via
+  ingress. Documents the least-privilege RBAC (namespace `Role` + the small
   CRD-read `ClusterRole`, §8) and the **CI-tested KubeRay range** (e.g. "tested
   against v1.3–v1.5", Q4 — a tested promise, not a runtime-derived one).
   **The read-only default is called out loudly:** mutations are OFF until
   `--allow-mutations` (and destructive ops until `--allow-destructive`), so a
   first-time user doesn't read "my agent can't create anything" as a bug.
   `ray_capabilities` echoes the enabled tiers.
+- **Helm chart** bundling the `Role` + CRD-read `ClusterRole`/bindings +
+  ServiceAccount (its reason to exist is the in-cluster HTTP deployment, Q7).
 - **Cheap adoption hedges (not deferred):** Apache-2.0, KubeRay-native naming, an
   MCP-registry listing, and a donation-ready README (§16).
+- HTTP auth: **static bearer (default) + K8s TokenReview (opt-in)**, both built in
+  v1 (Q8).
 - CI: `golangci-lint` + unit + envtest on every PR.
 
 **Deferred (add when earned):**
-- HTTP transport + bearer auth (the in-cluster deployment story).
-- Helm chart bundling the `Role` + `ClusterRole`/bindings + ServiceAccount.
 - GoReleaser multi-arch release pipeline.
-- Distroless Docker image.
-- OAuth 2.1 resource-server seam for HTTP.
+- Distroless image hardening.
+- `ray_job_stop` / CRD `spec.suspend` job-pause semantics (Q6).
+- OAuth 2.1 resource-server flow (TokenReview already realizes the in-cluster
+  identity story Q8 needed; OAuth only if external-IdP demand appears).
 
 ## 13. Verified Technical Facts (research-backed, 2026-06-13)
 
@@ -565,6 +625,14 @@ the SDK repo. Confirmed:
 - **Structural-schema pruning (Q4):** the K8s API server silently prunes unknown
   fields against the installed CRD schema — the basis for reading the Ray CRD
   schema to predict pruning before applying.
+- **Dashboard has no built-in auth (Q6):** the Ray dashboard / Job Submission API
+  is unauthenticated by default — the basis of the "ShadowRay" unauthenticated-RCE
+  attacks. This is why `ray-mcp` consumes it **read-only** and never exposes it as
+  a write path. In-cluster reachability uses cluster DNS to the head service
+  (`DirectDial`); out-of-cluster uses SPDY port-forward.
+- **K8s TokenReview API (Q8):** lets a server validate a presented ServiceAccount
+  token and obtain the caller's identity — the idiomatic in-cluster auth used for
+  the opt-in `tokenreview` mode (cheaper than full OAuth for in-cluster).
 
 ## 14. Open Questions / Future Work
 
@@ -595,7 +663,12 @@ Recorded so a reviewer can see *why* the chosen path won, not just what it is.
 | Version detection (Q4) | Read installed Ray CRD schema | Discovery of served apiVersions only | Schema read gives field-level truth (pruning prediction — the prize); discovery only gives a version string. |
 | API group (Q4) | `ray.io/v1` only | Also support `v1alpha1` | Legacy; supporting it dilutes the typed wedge for ~no adoption. |
 | Safety | Layered (flags + dryRun + protected + diff) | Trust RBAC alone | Published default could be over-permissioned; no dry-run/diff UX; too risky for a "hook any agent up" tool. |
-| HTTP auth (deferred) | Bearer + localhost default | Full OAuth 2.1 now | Overkill for self-hosted per-user v1; seam left for later. |
+| Ray API reach (Q6) | Auto-detected strategy (direct vs port-forward) | Always port-forward (old #5) | In-cluster, port-forward is pointless overhead + needs extra `pods/portforward` RBAC; direct cluster-DNS dial is cleaner. |
+| Ray API writes (Q6) | Read-only by construction | Expose `ray_job_stop` via dashboard API | Dashboard API is unauthenticated/RCE-capable; a Ray-side write path is a liability. CRD `spec.suspend` is the safer route, deferred. |
+| Tunnel lifecycle (Q6) | Pooled per (ns,cluster) + idle reaper | Per-call open/close (old R1) | Per-call re-dial is wasteful for status/logs polling; pooling keeps the no-multi-hour-block guarantee while avoiding churn. |
+| Transport scope (Q7) | Both stdio + HTTP in v1 | Defer HTTP+Helm to v1.1 | Guts the Helm chart's reason to exist, contradicts goal #5; the cheap part is plumbing and the costly part (auth) we design anyway. |
+| HTTP auth (Q8) | No-token only on loopback; token mandatory off-loopback; static + TokenReview | `--insecure` no-token mode | A tokenless network-reachable cluster-driver + autonomous agent is a loaded gun; remove the footgun entirely. |
+| HTTP auth (Q8) | TokenReview as the identity story | Full OAuth 2.1 now | TokenReview is the idiomatic, cheaper in-cluster realization; OAuth only if external-IdP demand appears. |
 
 ## 16. Project Posture, Survival Strategy & Standing Commitments (Q1/Q2)
 
