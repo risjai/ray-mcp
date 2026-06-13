@@ -51,9 +51,13 @@ KubeRay specs are exactly where agents fail:
 
 - **Typed worker-group autoscaling** (min/max/replicas per group) as first-class
   params, not hand-built spec paths.
-- **RayService reconfig awareness.** The mechanism is "patch `serveConfig`," but
-  `ray-mcp` understands it as a zero-downtime rollout and reports/guards it as
-  such.
+- **RayService reconfig awareness.** KubeRay has *two distinct* update paths and
+  an agent must not confuse them: editing `serveConfigV2` is an **in-place** update
+  to Serve apps on the existing cluster, whereas editing the cluster config (e.g.
+  `rayVersion`) triggers a **zero-downtime cluster swap** (KubeRay stands up a
+  pending cluster, waits, switches head-service traffic, deletes the old one).
+  `ray-mcp` knows which path a given change takes and reports it; a generic tool
+  patching raw YAML does not.
 - **Ray-tuned destructive guards** for operations whose danger is Ray-specific:
   scaling a worker group to zero, deleting a RayService that is serving traffic.
 
@@ -98,8 +102,8 @@ use. Distribution polish (§11) is justified by, and sequenced after, the wedge.
 | 5 | Ray API reach | Auto port-forward via the k8s API (SPDY), on demand — **core to the wedge** | yes |
 | 6 | Scope | Single cluster (one context), multi-namespace | yes |
 | 7 | HTTP auth | Bearer token; localhost default; refuse no-token unless `--insecure` | deferred (with HTTP) |
-| 8 | K8s client | KubeRay typed client + sigs.k8s.io/controller-runtime | yes |
-| 9 | MCP SDK | Official `github.com/modelcontextprotocol/go-sdk` | yes |
+| 8 | K8s client | KubeRay typed API (`ray-operator/apis/ray/v1`) + clientset (`ray-operator/pkg/client/clientset/versioned`) via sigs.k8s.io/controller-runtime | yes |
+| 9 | MCP SDK | Official `github.com/modelcontextprotocol/go-sdk` (**GA, v1.x**; stdio + streamable-HTTP transports) | yes |
 | 10 | Spec input | Curated typed params (primary) + `rawSpec` deep-merge escape hatch, gated & documented as advanced/unvalidated; curated params win on conflict (R7) | yes |
 | 11 | Safety model | Layered: tier flags + dryRun + protected annotation + diffs | yes |
 | 12 | KubeRay version | Pin to KubeRay `ray.io/v1` API; declare supported range; detect **served CRD apiVersions** via discovery (operator semver is not exposed by the API) | yes |
@@ -194,20 +198,24 @@ default namespace. Tools marked ★ depend on the wedge (dashboard API + tunnel)
 | `ray_job_delete` | destructive | Delete the RayJob resource |
 
 **Job identity.** The agent always refers to a job by its **RayJob k8s name**.
-The dashboard API speaks a different identifier (the *submission id*). The service
-bridges them via `RayJob.status.jobId` (submission id) and `status.dashboardURL`,
-both populated by KubeRay. If status is not yet populated (job not scheduled
-yet), wedge tools return a clear "job not yet scheduled" message rather than a
-tunnel/connection error. The agent never has to know the submission id exists.
+The Ray dashboard/job REST API is keyed by the **submission id** (the
+`raysubmit_...` handle, used for status/logs/stop). KubeRay surfaces that handle
+on the RayJob as **`status.jobId`** (this field *is* the submission id — there is
+no separate `submissionId` field), alongside **`status.dashboardURL`**,
+**`status.jobStatus`**, and **`status.jobDeploymentStatus`**. The service bridges
+name → submission id + dashboard endpoint via those status fields. If status is
+not yet populated (job not scheduled yet), wedge tools return a clear "job not yet
+scheduled" message rather than a tunnel/connection error. The agent never has to
+know the submission id exists.
 
 **Cluster target (R8 — resolved: both modes, explicit and mutually exclusive).**
 A RayJob either runs against an existing cluster or brings its own. `ray_job_submit`
 takes exactly one of:
-- `targetCluster: <name>` — run against an **existing** RayCluster (no cluster is
-  created or deleted by the job).
-- `clusterSpec: {curated params + rawSpec}` — KubeRay creates an **ephemeral**
-  cluster for the job and tears it down on completion (KubeRay's
-  `shutdownAfterJobFinishes`).
+- `targetCluster: <name>` — run against an **existing** RayCluster (maps to the
+  RayJob `spec.clusterSelector`); no cluster is created or deleted by the job.
+- `clusterSpec: {curated params + rawSpec}` — maps to RayJob
+  `spec.rayClusterSpec`; KubeRay creates an **ephemeral** cluster for the job and
+  tears it down on completion via `spec.shutdownAfterJobFinishes=true`.
 
 Supplying both, or neither, is a validation error. Because `clusterSpec` *creates
 a cluster* via a "submit job" call, it is gated behind `--allow-mutations` like any
@@ -220,7 +228,7 @@ created.
 | `ray_service_list` | read | List RayServices (+ serve status, healthy replicas) |
 | `ray_service_get` | read | Serve app status, route prefix, conditions |
 | `ray_service_deploy` | write | Create from serveConfig + cluster params (+ `rawSpec`), `dryRun` |
-| `ray_service_update` | write | Update serveConfig (zero-downtime reconfig), `dryRun`, diff |
+| `ray_service_update` | write | Update `serveConfigV2` (in-place) or cluster config (zero-downtime swap); reports which path the change takes; `dryRun`, diff |
 | `ray_service_delete` | destructive | Delete (honors `protected`; refuses if serving traffic unless forced) |
 
 ### Meta
@@ -274,11 +282,13 @@ return. There are no cross-call or multi-hour tunnels. On a mid-call SPDY failur
 gracefully per §10.
 
 ### B) `ray_job_logs` (the wedge, dashboard API path)
-1. `JobService.Logs`: resolve RayJob → its RayCluster → head service via KubeRay
-   client.
+1. `JobService.Logs`: resolve RayJob → submission id (`status.jobId`) + head
+   service via KubeRay client.
 2. `PortForwarder.Open(headSvc, 8265)` → ephemeral local port, scoped to this
-   single call.
-3. `RayAPIClient.JobLogs(submissionID)` over the tunnel → bounded tail → text.
+   single call. (8265 is the dashboard / Job Submission REST API port.)
+3. `RayAPIClient.JobLogs(submissionID)` → `GET /api/jobs/{submission_id}/logs`
+   over the tunnel → bounded tail → text. (Status path: `GET /api/jobs/{id}`;
+   submit: `POST /api/jobs/`; stop: `POST /api/jobs/{id}/stop`.)
 4. `defer` tunnel close — opened and closed within this one call.
 
 ### C) `ray_cluster_create` (write, pure CRD path)
@@ -293,9 +303,11 @@ gracefully per §10.
 ### D) `ray_cluster_update` / `ray_cluster_scale` (write, concurrency-safe)
 
 Worker replica counts on an autoscaling cluster are **live, contended fields** —
-the Ray autoscaler writes them, and another agent might too. A naive
-get→modify→put races and silently clobbers concurrent writes (classic Kubernetes
-lost update; worst-case on an autoscaling cluster).
+the Ray autoscaler writes `replicas` directly on the RayCluster CR (incrementing
+on scale-up, and reducing it plus populating `workersToDelete` on scale-down), and
+another agent might write too. A naive get→modify→put races and silently clobbers
+those autoscaler writes (classic Kubernetes lost update; worst-case on an
+autoscaling cluster). [verified: KubeRay autoscaling docs]
 
 1. Mutation gate → resolve target by name.
 2. Apply changes as a **partial patch, never a full-object put**:
@@ -407,7 +419,32 @@ user or a proven wedge** (per §2/§3 sequencing):
 - Distroless Docker image.
 - OAuth 2.1 resource-server seam for HTTP.
 
-## 13. Open Questions / Future Work
+## 13. Verified Technical Facts (research-backed, 2026-06-13)
+
+Load-bearing API claims were fact-checked against official Ray/KubeRay docs and
+the SDK repo before approval. Confirmed:
+
+- **MCP Go SDK** `github.com/modelcontextprotocol/go-sdk` is official (with Google),
+  **GA v1.x**, with `mcp.StdioTransport`, typed-schema `mcp.AddTool`, and
+  `StreamableHTTPHandler`.
+- **Ray dashboard / Job Submission REST API** on port **8265**; endpoints:
+  `POST /api/jobs/` (submit), `GET /api/jobs/{id}` (status),
+  `GET /api/jobs/{id}/logs` (logs), `POST /api/jobs/{id}/stop`. The `{id}` is the
+  **submission id** (`raysubmit_...`).
+- **`RayJob.status`** (`ray.io/v1`) exposes `jobId` (== submission id; no separate
+  `submissionId` field), `dashboardURL`, `jobStatus`, `jobDeploymentStatus`.
+- **RayJob targeting:** `spec.clusterSelector` (existing cluster) vs
+  `spec.rayClusterSpec` (ephemeral) + `spec.shutdownAfterJobFinishes`.
+  (`submissionMode` defaults to `K8sJobMode`.)
+- **API group/version** `ray.io/v1` for RayCluster/RayJob/RayService; typed client
+  at `ray-operator/apis/ray/v1` + `ray-operator/pkg/client/clientset/versioned`.
+- **Autoscaler writes `replicas`** (and `workersToDelete`) on the RayCluster CR →
+  the lost-update risk in §7.D is real. (No doc *recommendation* against manual
+  edits is claimed — only the mechanism.)
+- **RayService:** `serveConfigV2` change = **in-place** Serve update; cluster-config
+  change = **zero-downtime cluster swap**. Two different paths (§2, §6).
+
+## 14. Open Questions / Future Work
 
 - Broader KubeRay version compatibility beyond the pinned v1 range.
 - True streaming logs (vs. bounded tail) if/when the transport makes it
@@ -415,7 +452,7 @@ user or a proven wedge** (per §2/§3 sequencing):
 - The full deferred distribution set in §12, gated on demand.
 - Multi-cluster support, if demand emerges.
 
-## 14. Standing Commitments (eyes-open)
+## 15. Standing Commitments (eyes-open)
 
 - Publishing as OSS (#1) + version-pin discipline (#12) is a **maintenance
   commitment**: tracking KubeRay releases, issue triage, supporting user configs
