@@ -3,7 +3,7 @@
 **Date:** 2026-06-13
 **Status:** Draft for review
 **Repo:** `github.com/risjai/ray-mcp`
-**Incorporates:** grilling decisions Q1–Q5 (see `2026-06-13-ray-mcp-grilling-decisions.md`)
+**Incorporates:** grilling decisions Q1–Q15 (decided) + Q16 (open, see §14); full log in `2026-06-13-ray-mcp-grilling-decisions.md`
 
 ## 1. Summary
 
@@ -139,10 +139,10 @@ use. Distribution polish (§12) is justified by, and sequenced after, the wedge.
 | 8 | K8s client | controller-runtime **client package** (`pkg/client`, uncached, direct-to-API) + KubeRay Go types/scheme (`ray-operator/apis/ray/v1`); SSA (`client.Apply`) + `DryRunAll`. NOT the manager framework, NOT the generated clientset (Q3) | yes |
 | 9 | MCP SDK | Official `github.com/modelcontextprotocol/go-sdk` (**GA, v1.x**; stdio + streamable-HTTP transports) | yes |
 | 10 | Spec input | Curated typed params + `rawSpec` escape hatch via **RFC 7386 JSON Merge Patch, rawSpec-over-curated (rawSpec wins)**, arrays replace wholesale, identity-guarded, applied **unstructured**; `--allow-raw-spec` gate (Q5) | yes |
-| 11 | Safety model | Layered: tier flags + MCP tool annotations + dryRun(default false) + **confirm-token on destructive tier** + self-gating `protected` annotation + diffs + RBAC floor (Q9/Q10) | yes |
+| 11 | Safety model | Layered: tier flags + MCP tool annotations + dryRun(default false) + **confirm-fingerprint on destructive tier** + self-gating `protected` annotation + diffs + RBAC floor (Q9/Q10) | yes |
 | 12 | KubeRay version | `ray.io/v1` only (no v1alpha1); compile against latest GA KubeRay at first commit (v1.5.x as of 2026-06), bump deliberately; **read the installed Ray CRD schema** for pruning prediction + best-effort version; CI-tested range in README (Q4) | yes |
 | 13 | Logs | Bounded tail (last-N-lines / since-duration), not streaming | yes |
-| 14 | Mutation interaction (Q9) | MCP annotations on every tool; `dryRun` defaults **false** for writes (server still dry-runs+diffs internally); **confirm-token two-step on destructive ops only** | yes |
+| 14 | Mutation interaction (Q9) | MCP annotations on every tool; `dryRun` defaults **false** for writes (server still dry-runs+diffs internally); **confirm-fingerprint two-step on destructive ops only** | yes |
 | 15 | Long-running ops (Q11) | Non-blocking by default; bounded `ray_job_wait` (≤120s, `until=running\|terminal`); wedge = **status distillation** ("stuck: no GPU nodes"), not server-side polling | yes |
 
 ## 5. Architecture
@@ -191,6 +191,11 @@ it depends on Go interfaces — which makes it unit-testable with fakes.
   is never a write vector through this tool.
 - **One instance = one Kubernetes context**, bound at startup; multi-namespace
   within that context.
+- **The server holds no cross-call state (Q14).** Confirmations are
+  content-derived fingerprints, not server-issued tokens; nothing is stored
+  between calls. This keeps the HTTP deployment horizontally scalable and
+  upgrade-safe. (Reachability tunnels are a process-local *cache*, transparently
+  re-dialed — not semantic state a call depends on.)
 - **Reachability is a strategy (Q6).** A `RayReachability` port with two adapters
   — `DirectDial` (in-cluster, via cluster DNS, no `pods/portforward` RBAC) and
   `PortForward` (SPDY, out-of-cluster) — selected by `--ray-access=auto|direct|
@@ -233,8 +238,8 @@ default namespace. Tools marked ★ depend on the wedge (dashboard API + tunnel)
 | `ray_cluster_events` | read | Recent k8s events for the cluster's pods |
 | `ray_cluster_create` | write | Create via the unified apply pipeline (§7.C), `dryRun` |
 | `ray_cluster_update` | write | Patch image/resources/replicas/autoscaling via SSA, `dryRun`, diff |
-| `ray_cluster_scale` | write | Scale a worker group min/max/replicas via SSA, `dryRun`, diff. **Scale-to-zero is destructive** (confirm-token) |
-| `ray_cluster_delete` | destructive | Delete (honors `protected`); **confirm-token** (Q9), `dryRun` |
+| `ray_cluster_scale` | write | Scale a worker group min/max/replicas via SSA, `dryRun`, diff. **Scale-to-zero is destructive** (confirm-fingerprint) |
+| `ray_cluster_delete` | destructive | Delete (honors `protected`); **confirm-fingerprint** (Q9), `dryRun` |
 
 ### RayJob
 | Tool | Tier | Purpose |
@@ -244,7 +249,7 @@ default namespace. Tools marked ★ depend on the wedge (dashboard API + tunnel)
 | `ray_job_logs` | read ★ | Bounded tail of job logs via Ray Job API (over tunnel) |
 | `ray_job_wait` | read | **Bounded** wait (≤120s, well under client timeout) `until=running\|terminal`; returns current status + `reached` bool. Default `until=running` (Q11) |
 | `ray_job_submit` | write ★ | entrypoint + runtimeEnv + cluster target (see below); **non-blocking** — returns `{name, jobId-when-available, initialStatus}` immediately (Q11); `dryRun`. Creates a RayJob *CRD* (guarded CRD path) — not a Ray-side write |
-| `ray_job_delete` | destructive | Delete the RayJob resource (**confirm-token**, Q9) |
+| `ray_job_delete` | destructive | Delete the RayJob resource (**confirm-fingerprint**, Q9) |
 
 > **`ray_job_stop` is deferred from v1 (Q6).** It was the only Ray-side write
 > candidate, and v1 keeps the dashboard API read-only by construction. The
@@ -284,7 +289,7 @@ created.
 | `ray_service_get` | read | **Distilled** rollout status (Q11): rollout phase, old/new serve health, cutover state — not raw `.status` |
 | `ray_service_deploy` | write | Create via the unified apply pipeline (serveConfigV2 + cluster params + `rawSpec`), `dryRun` |
 | `ray_service_update` | write | Update `serveConfigV2` (in-place) or cluster config (zero-downtime swap); reports which path the change takes; `dryRun`, diff |
-| `ray_service_delete` | destructive | Delete (honors `protected`; refuses if serving traffic unless forced); **confirm-token** (Q9) |
+| `ray_service_delete` | destructive | Delete (honors `protected`; refuses if serving traffic unless forced); **confirm-fingerprint** (Q9) |
 
 ### Meta
 | Tool | Tier | Purpose |
@@ -463,15 +468,22 @@ Layered defense-in-depth; never relies on the agent behaving well.
   and no K8s tooling previews by default. The agent can pass `dryRun=true` to
   preview; the §7.C pipeline runs a server-side dry-run + diff internally on
   every apply regardless.
-- **Confirm-token on the destructive tier only (Q9).** `ray_cluster_delete`,
-  `ray_service_delete`, and destructive scale-downs return a diff + a server
-  token; the commit requires echoing that token in a second call. Plain writes
-  (create/update/submit) do **not** need it — the cost is justified only for
-  irreversible / traffic-affecting ops.
+- **Stateless confirm-fingerprint on the destructive tier only (Q9/Q14).**
+  `ray_cluster_delete`, `ray_service_delete`, and destructive scale-downs return a
+  diff plus a **content-derived fingerprint = hash(resourceUID + resourceVersion +
+  operation)**; the commit call passes `confirm=<fingerprint>` and the server
+  **recomputes from the live object and compares** — it stores **no pending
+  state**. Plain writes (create/update/submit) do **not** need it. Two wins over a
+  server-issued random token: (1) the server stays stateless, so the HTTP
+  deployment is trivially horizontally scalable and survives rolling upgrades;
+  (2) because `resourceVersion` is in the hash, any change to the resource between
+  preview and commit flips the fingerprint → **stale confirm is rejected** (free
+  TOCTOU / optimistic-concurrency protection, equivalent to a `resourceVersion`
+  delete precondition).
 - **Protected annotation — self-gating, honest (Q10).** `ray-mcp/protected="true"`
   makes delete and destructive scale-down refuse, regardless of flags.
   Critically, **removing or changing that annotation via any patch this tool
-  issues is itself refused unless the destructive confirm-token is presented** —
+  issues is itself refused unless the destructive confirm-fingerprint is presented** —
   otherwise the guard is decorative (agent could just strip the annotation, then
   delete). Documented honestly as a **guardrail against fat-finger / confused-agent
   deletion through this tool, NOT a security control** ("defense against mistakes,
@@ -558,16 +570,28 @@ terminated at ingress/mesh, not in the binary.
 terminal.** Every payload is bounded by design; unbounded output is a context
 bomb that degrades the agent.
 
-**Output contract (token-bounded):**
-- **Diffs are field-level and summarized:** changed paths with old→new *scalar*
-  values. Large nested subtrees are summarized, not inlined — e.g.
-  "`workerGroups[0].template` changed (3 fields)" rather than dumping the pod
-  template. An opt-in `verbose` arg returns the full diff when truly needed.
-- **List tools paginate / cap** (default ~50 items) and report "N more
-  available" rather than returning unbounded lists.
-- **Logs** are already a bounded tail (decision #13).
+**Output contract (token-bounded — Q13).** Token economy is a **cross-cutting
+rule**, not a per-tool afterthought: aggressive defaults, with explicit escape
+hatches so the agent can ask for more but can never un-spend forced tokens.
+- **Two-tier verbosity.** `list` → a tiny row per item (name, phase, ready
+  replicas, age, 1-line health), never full status. `get` → the distilled view
+  (Q11), not raw `.status`. A **`verbose`/`raw` arg on `get`** (default off)
+  returns the full object when genuinely needed.
+- **Every list paginates + caps.** Hard default cap (~50) plus `limit` and a
+  `continue` token (reusing the k8s `continue` token). "Showing 50 of 213,
+  continue token X" — **never silently truncate** (surface confusion, not silence).
+- **Logs are byte/token-bounded, not just line-bounded.** `tailLines` *and* a hard
+  byte ceiling (~10–20KB) with a "truncated, N bytes omitted" marker — a 10K-line
+  stack trace is effectively unbounded if you only cap lines. Default to tail.
+- **Diffs summarized by default:** "3 fields changed: replicas 2→5, image X→Y,
+  +annotation Z"; large nested subtrees collapse to "`workerGroups[0].template`
+  changed (3 fields)"; the full structural diff is behind `verbose`.
+- **MCP structured + text dual output (go-sdk).** Lead with compact
+  `structuredContent`; add a short human `text` summary; never pretty-print giant
+  YAML into the result.
 - **Errors and events are truncated** to a bounded, relevant slice (e.g. last N
-  events / the admission message), never the raw firehose.
+  events / the admission message), never the raw firehose. (`ray_*_events` is
+  voluminous and gets the same treatment.)
 - **Pruning warnings** (Q4) name the dropped field paths concisely.
 
 **Errors:**
@@ -586,7 +610,7 @@ bomb that degrades the agent.
   `RayAPIPort`. Covers guards, the unified apply pipeline (RFC 7386 merge with
   rawSpec-wins, arrays-replace, identity guard, unstructured preservation), diff,
   tier logic, the non-blocking submit + bounded `ray_job_wait` + status
-  distillation (§7.A, Q11), the **confirm-token** two-step on the destructive tier
+  distillation (§7.A, Q11), the **confirm-fingerprint** two-step on the destructive tier
   and **`protected` self-gating** (removal refused without the token; Q9/Q10), and
   the namespace-set gate ("not configured for namespace X"; Q12). No cluster
   required.
@@ -697,9 +721,49 @@ the SDK repo. Confirmed:
 
 ## 14. Open Questions / Future Work
 
+**⏳ Q16 — `ray_job_submit` ephemeral vs. existing cluster (RAISED, NOT DECIDED —
+needs user sign-off before implementation).** A KubeRay RayJob runs in two modes:
+**ephemeral** (`spec.rayClusterSpec` — the job creates its own RayCluster and, if
+`shutdownAfterJobFinishes=true`, tears it down) or **existing-cluster**
+(`spec.clusterSelector` — submits to a running RayCluster, never touches its
+lifecycle). This matters because:
+- **`ray_job_delete` blast radius is mode-dependent** — deleting an *ephemeral*
+  job can cascade-delete a whole RayCluster (and every other job/actor on it),
+  whereas deleting an *existing-cluster* job just removes the record. Q9/Q14
+  currently treat `ray_job_delete` as one uniform destructive op.
+- **`shutdownAfterJobFinishes` is an agent footgun**: default-off → orphaned
+  GPU-burning clusters (cost surprise); default-on → cluster gone before
+  post-mortem (lost debugging).
+- Leaning (pending decision): explicit `existingCluster:<name>` XOR
+  `clusterSpec:{curated + rawSpec}` (both/neither → error); make `ray_job_delete`
+  **mode-aware** (ephemeral-with-cascade → destructive tier + confirm-fingerprint;
+  existing-cluster → plain write); default `shutdownAfterJobFinishes=true` with a
+  "pass false to keep for debugging" hint. *Note:* §6 currently sketches a
+  `targetCluster`/`clusterSpec` split; Q16 would formalize it and add the
+  mode-aware-delete nuance. **Not yet ratified.**
+
+**Open item inside a decided question:**
+- **Q15:** verify the official go-sdk supports MCP tool annotations
+  (`destructiveHint`/`readOnlyHint`/`idempotentHint`), `structuredContent` dual
+  output, and the in-memory transport — at implementation start. Reasoned from a
+  Jan-2026 cutoff, not yet verified; low-risk because the SDK is quarantined behind
+  `internal/mcp/`. If missing, it changes either the SDK choice or those decisions.
+
+**Not yet grilled (candidate future questions, from the grilling status summary):**
+- RayService zero-downtime **update** semantics — what the tool exposes and how
+  rollout progress is distilled (pairs with Q11).
+- `ray_cluster_scale` vs `ray_cluster_update` overlap (scale is a subset — keep
+  both or fold?).
+- The project's own versioning/release strategy (semver, KubeRay-compat matrix,
+  breaking-change policy) — distinct from Q4's KubeRay baseline.
+- Observability specifics (metrics, structured-log schema, correlation with the
+  Q8 audit log).
+- Error-taxonomy completeness — is `NotFound/Forbidden/Conflict/RayAPIUnreachable/
+  Timeout` sufficient; how SSA field-manager `Conflict` surfaces to the agent.
+
+**Longer-horizon:**
 - Broader KubeRay version compatibility beyond the CI-tested range.
-- True streaming logs (vs. bounded tail) if/when the transport makes it
-  ergonomic.
+- True streaming logs (vs. bounded tail) if/when the transport makes it ergonomic.
 - The full deferred distribution set in §12, gated on demand.
 - Multi-cluster support, if demand emerges.
 - `apiserversdk` as an HTTP-deployment / ray-project-alignment surface (§16).
@@ -730,9 +794,10 @@ Recorded so a reviewer can see *why* the chosen path won, not just what it is.
 | Transport scope (Q7) | Both stdio + HTTP in v1 | Defer HTTP+Helm to v1.1 | Guts the Helm chart's reason to exist, contradicts goal #5; the cheap part is plumbing and the costly part (auth) we design anyway. |
 | HTTP auth (Q8) | No-token only on loopback; token mandatory off-loopback; static + TokenReview | `--insecure` no-token mode | A tokenless network-reachable cluster-driver + autonomous agent is a loaded gun; remove the footgun entirely. |
 | HTTP auth (Q8) | TokenReview as the identity story | Full OAuth 2.1 now | TokenReview is the idiomatic, cheaper in-cluster realization; OAuth only if external-IdP demand appears. |
-| Mutation default (Q9) | `dryRun=false` + annotations + confirm-token on destructive | `dryRun=true` everywhere | Preview-by-default has a silent-non-action failure mode — agent sees "would create," believes it's done, never commits; actively misleads an autonomous agent. |
-| Mutation confirm (Q9) | Confirm-token on destructive tier only | Confirm-token on all writes | Server-held pending state + two-step is real cost; justified only for irreversible/traffic-affecting ops, not routine create/update. |
-| `protected` (Q10) | Keep, self-gate its removal, document as anti-fat-finger | Drop it / rely on RBAC only | "Don't accidentally delete prod" is genuinely useful for an agent-driven tool once confirm-token exists — provided it isn't oversold as security. |
+| Mutation default (Q9) | `dryRun=false` + annotations + confirm-fingerprint on destructive | `dryRun=true` everywhere | Preview-by-default has a silent-non-action failure mode — agent sees "would create," believes it's done, never commits; actively misleads an autonomous agent. |
+| Mutation confirm (Q9) | Confirm on destructive tier only | Confirm on all writes | The two-step is real friction; justified only for irreversible/traffic-affecting ops, not routine create/update. |
+| Confirm mechanism (Q14) | Stateless content-derived fingerprint | Server-issued random token + pending-state TTL | Random token needs an in-memory map (breaks across HTTP replicas/rolling upgrades) + TTL reaper; its only edge — *guaranteeing* the preview happened — is unenforceable anyway. Fingerprint is stateless and gives free TOCTOU rejection. |
+| `protected` (Q10) | Keep, self-gate its removal, document as anti-fat-finger | Drop it / rely on RBAC only | "Don't accidentally delete prod" is genuinely useful for an agent-driven tool once confirm-fingerprint exists — provided it isn't oversold as security. |
 | `protected` (Q10) | Server-enforced annotation | API-server `finalizers` | Finalizers block kubectl too, but easily wedge resources into stuck states — too sharp a footgun for v1. |
 | Long-running ops (Q11) | Non-blocking + bounded `ray_job_wait` + distillation | Block-and-poll to completion | Hits the MCP client timeout on exactly the long jobs that matter; call dies, job runs on, agent thinks it failed — the #1 way the tool would feel broken. |
 | Namespace/RBAC (Q12) | Two explicit modes; SelfSubjectAccessReview reconciles flag↔RBAC | Always ship ClusterRole, gate ns at app level | Simpler Helm, but makes the least-privilege claim false by default — bad for the posture-B (donation/alignment) credibility. |
