@@ -134,14 +134,16 @@ use. Distribution polish (§12) is justified by, and sequenced after, the wedge.
 | 3 | Control plane | KubeRay CRDs **and** Ray dashboard/job API as **co-core** (cross-plane path is the wedge) | yes |
 | 4 | Operation surface | Full lifecycle read+write, guarded (safe by default) | yes |
 | 5 | Ray API reach | **Auto-detected reachability strategy** (Q6): DirectDial in-cluster vs SPDY PortForward out-of-cluster (`--ray-access=auto\|direct\|port-forward`). Dashboard/Job API consumed **read-only by construction**. Pooled tunnel per (ns,cluster) + idle reaper. **Core to the wedge** | yes |
-| 6 | Scope | Single cluster (one context), multi-namespace | yes |
+| 6 | Scope | Single cluster (one context); **two namespace modes** (Q12): namespaced (default, Role+RoleBinding per ns) or cluster (`--allow-all-namespaces` → ClusterRole, opt-in). Flag↔RBAC reconciled at boot via SelfSubjectAccessReview | yes |
 | 7 | HTTP auth | **Non-loopback bind ⇒ token mandatory, no bypass** (Q8; `--insecure` killed). Default bind `127.0.0.1`. Static bearer (default) + K8s **TokenReview** (opt-in, built in v1). TLS to ingress/mesh. Audit-log every mutation | yes |
 | 8 | K8s client | controller-runtime **client package** (`pkg/client`, uncached, direct-to-API) + KubeRay Go types/scheme (`ray-operator/apis/ray/v1`); SSA (`client.Apply`) + `DryRunAll`. NOT the manager framework, NOT the generated clientset (Q3) | yes |
 | 9 | MCP SDK | Official `github.com/modelcontextprotocol/go-sdk` (**GA, v1.x**; stdio + streamable-HTTP transports) | yes |
 | 10 | Spec input | Curated typed params + `rawSpec` escape hatch via **RFC 7386 JSON Merge Patch, rawSpec-over-curated (rawSpec wins)**, arrays replace wholesale, identity-guarded, applied **unstructured**; `--allow-raw-spec` gate (Q5) | yes |
-| 11 | Safety model | Layered: tier flags + dryRun + protected annotation + diffs + RBAC floor | yes |
+| 11 | Safety model | Layered: tier flags + MCP tool annotations + dryRun(default false) + **confirm-token on destructive tier** + self-gating `protected` annotation + diffs + RBAC floor (Q9/Q10) | yes |
 | 12 | KubeRay version | `ray.io/v1` only (no v1alpha1); compile against latest GA KubeRay at first commit (v1.5.x as of 2026-06), bump deliberately; **read the installed Ray CRD schema** for pruning prediction + best-effort version; CI-tested range in README (Q4) | yes |
 | 13 | Logs | Bounded tail (last-N-lines / since-duration), not streaming | yes |
+| 14 | Mutation interaction (Q9) | MCP annotations on every tool; `dryRun` defaults **false** for writes (server still dry-runs+diffs internally); **confirm-token two-step on destructive ops only** | yes |
+| 15 | Long-running ops (Q11) | Non-blocking by default; bounded `ray_job_wait` (≤120s, `until=running\|terminal`); wedge = **status distillation** ("stuck: no GPU nodes"), not server-side polling | yes |
 
 ## 5. Architecture
 
@@ -231,17 +233,18 @@ default namespace. Tools marked ★ depend on the wedge (dashboard API + tunnel)
 | `ray_cluster_events` | read | Recent k8s events for the cluster's pods |
 | `ray_cluster_create` | write | Create via the unified apply pipeline (§7.C), `dryRun` |
 | `ray_cluster_update` | write | Patch image/resources/replicas/autoscaling via SSA, `dryRun`, diff |
-| `ray_cluster_scale` | write | Scale a worker group min/max/replicas via SSA, `dryRun`, diff |
-| `ray_cluster_delete` | destructive | Delete (honors `protected`), `dryRun` |
+| `ray_cluster_scale` | write | Scale a worker group min/max/replicas via SSA, `dryRun`, diff. **Scale-to-zero is destructive** (confirm-token) |
+| `ray_cluster_delete` | destructive | Delete (honors `protected`); **confirm-token** (Q9), `dryRun` |
 
 ### RayJob
 | Tool | Tier | Purpose |
 |------|------|---------|
 | `ray_job_list` | read | List RayJobs (+ deployment/job status) |
-| `ray_job_get` | read ★ | Status incl. live dashboard job status, start/end, message |
+| `ray_job_get` | read ★ | **Distilled, agent-actionable** status (Q11): phase, progressing-vs-wedged (e.g. "Pending: unschedulable, no GPU nodes" + pod event), terminal exit + logs pointer — not raw `.status` |
 | `ray_job_logs` | read ★ | Bounded tail of job logs via Ray Job API (over tunnel) |
-| `ray_job_submit` | write ★ | entrypoint + runtimeEnv + cluster target (see below); optional bounded `wait` (then follow via `ray_job_get`); `dryRun`. Creates a RayJob *CRD* (guarded CRD path) — not a Ray-side write |
-| `ray_job_delete` | destructive | Delete the RayJob resource |
+| `ray_job_wait` | read | **Bounded** wait (≤120s, well under client timeout) `until=running\|terminal`; returns current status + `reached` bool. Default `until=running` (Q11) |
+| `ray_job_submit` | write ★ | entrypoint + runtimeEnv + cluster target (see below); **non-blocking** — returns `{name, jobId-when-available, initialStatus}` immediately (Q11); `dryRun`. Creates a RayJob *CRD* (guarded CRD path) — not a Ray-side write |
+| `ray_job_delete` | destructive | Delete the RayJob resource (**confirm-token**, Q9) |
 
 > **`ray_job_stop` is deferred from v1 (Q6).** It was the only Ray-side write
 > candidate, and v1 keeps the dashboard API read-only by construction. The
@@ -278,10 +281,10 @@ created.
 | Tool | Tier | Purpose |
 |------|------|---------|
 | `ray_service_list` | read | List RayServices (+ serve status, healthy replicas) |
-| `ray_service_get` | read | Serve app status, route prefix, conditions |
+| `ray_service_get` | read | **Distilled** rollout status (Q11): rollout phase, old/new serve health, cutover state — not raw `.status` |
 | `ray_service_deploy` | write | Create via the unified apply pipeline (serveConfigV2 + cluster params + `rawSpec`), `dryRun` |
 | `ray_service_update` | write | Update `serveConfigV2` (in-place) or cluster config (zero-downtime swap); reports which path the change takes; `dryRun`, diff |
-| `ray_service_delete` | destructive | Delete (honors `protected`; refuses if serving traffic unless forced) |
+| `ray_service_delete` | destructive | Delete (honors `protected`; refuses if serving traffic unless forced); **confirm-token** (Q9) |
 
 ### Meta
 | Tool | Tier | Purpose |
@@ -311,25 +314,30 @@ in-server field policy (§8).
 
 ## 7. Data Flow
 
-### A) `ray_job_submit` → completion (the wedge, cross-plane, async-over-sync)
+### A) `ray_job_submit` → follow (the wedge, cross-plane, non-blocking — Q11)
 
-MCP tool calls are request/response; a Ray job can run for hours. We therefore
-**never** block a tool call (or hold a tunnel) for the lifetime of a job. Instead
-we use the standard async-over-sync pattern: submit returns fast, a bounded wait
-is best-effort, and the agent loops on `get` to follow long jobs.
+MCP tool calls are request/response with a client timeout (~tens of seconds); a
+Ray job runs minutes-to-hours. Blocking server-side to completion is a **trap**:
+it times out on exactly the long jobs that matter, the call dies while the job
+keeps running, and the agent wrongly concludes failure. So submit is **never
+blocking**, and waiting is a *separate, bounded* tool.
 
 1. MCP layer decodes args → `SubmitJobRequest` DTO; schema validation up front.
 2. `JobService.Submit`: mutation gate → build the RayJob via the unified apply
    pipeline (§7.C: curated base, `rawSpec` merged over it, rawSpec wins) →
-   `DryRunAll` → SSA-apply. Returns the RayJob **name** immediately.
-3. If `wait=true` (default false): do a **bounded** wait capped by `waitTimeout`
-   (default 120s). Within that window, open an ephemeral tunnel for *this call
-   only* and poll dashboard job status.
-4. Return one of: terminal status (succeeded/failed), or — if the cap is hit while
-   still running — `{state: running, name, jobId, message: "still running; call
-   ray_job_get to continue"}`. The agent follows long jobs by polling
-   `ray_job_get`. Optional MCP progress notifications may be emitted during the
-   bounded wait, but correctness never depends on the client handling them.
+   `DryRunAll` → SSA-apply. **Returns immediately**: `{name, jobId (when
+   available), initialStatus}`. Never blocks to completion.
+3. The agent **follows** via two read tools (no server-side long-poll):
+   - `ray_job_wait(name, waitSeconds≤120, until=running|terminal)` — a **bounded**
+     wait capped well under client timeouts; default `until=running` answers "did
+     it start, or is it stuck Pending?". Returns current status + a `reached` bool.
+   - `ray_job_get(name)` — **distilled, agent-actionable** status: phase,
+     progressing-vs-wedged ("Pending: unschedulable, no GPU nodes" + the pod
+     event), terminal exit + a logs pointer. This *distillation* — handing the
+     agent "stuck because no GPU nodes" instead of raw `.status` YAML — is itself
+     part of the wedge differentiation (Q11).
+4. README documents the canonical agent loop: **submit → wait(running) → poll get
+   → logs**. Tunnels used by `wait`/`get`/`logs` follow the pooled model below.
 
 **Tunnel lifecycle (Q6):** reachability is resolved via the `RayReachability`
 strategy — `DirectDial` when in-cluster (no tunnel at all), `PortForward` (SPDY)
@@ -353,32 +361,37 @@ sequenceDiagram
     participant K8s as Kubernetes<br>API
     participant Ray as Ray Dashboard<br>(head :8265, read-only)
 
-    Agent->>+MCP: ray_job_submit(entrypoint, target, wait=true)
+    Agent->>+MCP: ray_job_submit(entrypoint, target)
     MCP->>+Svc: SubmitJobRequest (validated)
     Note over Svc: mutation gate.<br>build RayJob (rawSpec over<br>curated, RFC 7386).<br>DryRunAll then SSA
     Svc->>+K8s: SSA-apply RayJob (ray.io/v1)
     K8s-->>-Svc: accepted (name)
+    Svc-->>-MCP: {name, jobId-when-ready, initialStatus}
+    MCP-->>-Agent: returns immediately (non-blocking)
 
-    opt wait=true (bounded by waitTimeout, default 120s)
-        Svc->>+K8s: read RayJob.status.jobId + dashboardURL
-        K8s-->>-Svc: submission id + head svc
-        Svc->>+Reach: Endpoint(ns, cluster, 8265)
-        Note over Reach: DirectDial in-cluster,<br>else reuse/open pooled<br>SPDY tunnel
-        Reach-->>-Svc: dashboard endpoint (warm)
-        loop until terminal or waitTimeout
-            Svc->>+Ray: GET /api/jobs/{submission_id}
-            Ray-->>-Svc: jobStatus
-        end
+    Note over Agent,Ray: Agent follows the job with bounded reads — never a server-side long-poll.
+
+    Agent->>+MCP: ray_job_wait(name, waitSeconds<=120, until=running)
+    MCP->>+Svc: wait request
+    Svc->>+Reach: Endpoint(ns, cluster, 8265)
+    Note over Reach: DirectDial in-cluster,<br>else reuse/open pooled<br>SPDY tunnel
+    Reach-->>-Svc: dashboard endpoint (warm)
+    loop until reached or waitSeconds cap
+        Svc->>+Ray: GET /api/jobs/{submission_id}
+        Ray-->>-Svc: jobStatus
     end
+    Svc-->>-MCP: {status, reached: bool}
+    MCP-->>-Agent: bounded result
 
-    alt terminal within cap
-        Svc-->>MCP: status = SUCCEEDED / FAILED
-    else still running at cap
-        Svc-->>-MCP: state=running + "call ray_job_get to continue"
-    end
-    MCP-->>-Agent: bounded result (no multi-hour block)
+    Agent->>+MCP: ray_job_get(name)  %% distilled status
+    MCP->>+Svc: get
+    Svc->>+Ray: GET /api/jobs/{submission_id}
+    Ray-->>-Svc: raw status
+    Note over Svc: distill: phase,<br>progressing-vs-wedged,<br>exit + logs pointer
+    Svc-->>-MCP: distilled status
+    MCP-->>-Agent: "Pending: no GPU nodes" etc.
 
-    Note over Agent,Ray: For long jobs the agent polls ray_job_get.<br>Tunnel is pooled per (ns,cluster), reaped when idle.
+    Note over Agent,Ray: Tunnel pooled per (ns,cluster), reaped when idle.
 ```
 
 ### B) `ray_job_logs` (the wedge, dashboard API path — read-only)
@@ -440,9 +453,31 @@ Layered defense-in-depth; never relies on the agent behaving well.
 
 - **Tier gating at registration.** read always on; write needs `--allow-mutations`;
   destructive needs `--allow-destructive`. Disabled tools are not advertised.
-- **`dryRun` arg** on every mutating tool → `DryRunAll` / diff only, no mutation.
-- **Protected annotation.** `ray-mcp/protected="true"` on a resource makes delete
-  and destructive scale-down refuse with a clear message, regardless of flags.
+- **MCP tool annotations (Q9).** Every tool is tagged — `readOnlyHint` on reads,
+  `destructiveHint` on delete/destructive-scale, `idempotentHint` on SSA
+  update/scale — so compliant clients auto-prompt the human. Free protocol-layer
+  "safe by default," independent of the other layers.
+- **`dryRun` defaults `false` for writes (Q9).** Deliberate: a `dryRun=true`
+  default has a *silent-non-action* failure mode (the agent sees "would create,"
+  believes it's done, never commits) that actively misleads an autonomous agent,
+  and no K8s tooling previews by default. The agent can pass `dryRun=true` to
+  preview; the §7.C pipeline runs a server-side dry-run + diff internally on
+  every apply regardless.
+- **Confirm-token on the destructive tier only (Q9).** `ray_cluster_delete`,
+  `ray_service_delete`, and destructive scale-downs return a diff + a server
+  token; the commit requires echoing that token in a second call. Plain writes
+  (create/update/submit) do **not** need it — the cost is justified only for
+  irreversible / traffic-affecting ops.
+- **Protected annotation — self-gating, honest (Q10).** `ray-mcp/protected="true"`
+  makes delete and destructive scale-down refuse, regardless of flags.
+  Critically, **removing or changing that annotation via any patch this tool
+  issues is itself refused unless the destructive confirm-token is presented** —
+  otherwise the guard is decorative (agent could just strip the annotation, then
+  delete). Documented honestly as a **guardrail against fat-finger / confused-agent
+  deletion through this tool, NOT a security control** ("defense against mistakes,
+  not adversaries; real protection is RBAC"). API-server `finalizers` (which would
+  also block `kubectl`) are noted but **not** used in v1 — too easy to wedge
+  resources into stuck states.
 - **Ray-tuned destructive guards.** Scaling a worker group to zero and deleting a
   RayService that is actively serving traffic are treated as destructive and
   guarded accordingly (refuse-unless-forced + clear impact message).
@@ -468,15 +503,26 @@ Layered defense-in-depth; never relies on the agent behaving well.
   and/or admission, or set `--allow-raw-spec=false` (curated-only hard mode).
   *Considered and rejected for v1:* a built-in denylist of scary fields — it would
   be a worse copy of PodSecurity admission.
-- **RBAC is the floor (Q4 shape).** App guards layer on top of whatever the
-  kubeconfig/SA permits. Shipped RBAC = a **namespace `Role`** (the Ray CRDs +
-  pods/events/services/portforward it needs) **plus a small cluster-scoped
-  `ClusterRole`** granting `get customresourcedefinitions` restricted via
-  `resourceNames: [rayclusters.ray.io, rayjobs.ray.io, rayservices.ray.io]` (for
-  schema read / pruning prediction). The ClusterRole is **use-if-present**: if the
-  SA lacks it, `ray-mcp` degrades gracefully (`crdVersion: "unknown (insufficient
-  RBAC)"`, falls back to post-apply read-back diff). README keeps a least-privilege
-  story: "namespace Role + read 3 named Ray CRDs cluster-scoped."
+- **RBAC is the floor (Q4 + Q12 shape).** App guards layer on top of whatever the
+  kubeconfig/SA permits. Two explicit namespace modes:
+  - **Namespaced (default, the least-privilege story):** operate over a configured
+    namespace set; Helm ships a **`Role`+`RoleBinding` per namespace** (templated
+    list, default = release namespace). A tool call outside the set is refused
+    with a clear "not configured for namespace X" *before* hitting the API.
+  - **Cluster (opt-in, `--allow-all-namespaces`):** ships a
+    **`ClusterRole`+`ClusterRoleBinding`** (OFF by default) — the only mode that
+    enables cluster-wide list / arbitrary-namespace access.
+  - Plus the small cluster-scoped `ClusterRole` granting `get
+    customresourcedefinitions` restricted via `resourceNames: [rayclusters.ray.io,
+    rayjobs.ray.io, rayservices.ray.io]` (schema read / pruning prediction),
+    **use-if-present**: if absent, degrade gracefully (`crdVersion: "unknown
+    (insufficient RBAC)"`, fall back to post-apply read-back diff).
+- **Flag↔RBAC must agree, fail loud (Q12).** At startup a **SelfSubjectAccessReview**
+  determines the actual scope; if `--allow-all-namespaces` is set but the SA lacks
+  cluster-wide list, the server **refuses to start** (or loud-warn downgrades)
+  rather than emitting confusing per-call `Forbidden`s. `ray_capabilities` reports
+  the namespaces actually served — self-report matches reality (same honesty
+  principle as Q4/Q8).
 
 ## 9. Configuration
 
@@ -488,7 +534,7 @@ wired in v1 (Q7/Q8).
 | `--transport` | `RAY_MCP_TRANSPORT` | `stdio` | `stdio` (primary) or `http` | yes |
 | `--context` | `RAY_MCP_CONTEXT` | current context | Kubeconfig context to bind | yes |
 | `--kubeconfig` | `KUBECONFIG` | discovery / in-cluster SA | Credentials source | yes |
-| `--default-namespace` | `RAY_MCP_NAMESPACE` | `default` | Namespace when a tool omits one | yes |
+| `--default-namespace` | `RAY_MCP_NAMESPACE` | pod's own ns in-cluster, else `default` | Namespace when a tool omits one (Q12: reads SA-token ns file in-cluster) | yes |
 | `--allow-all-namespaces` | `RAY_MCP_ALL_NS` | `false` | Permit cluster-wide list | yes |
 | `--ray-access` | `RAY_MCP_RAY_ACCESS` | `auto` | Reachability strategy: `auto`\|`direct`\|`port-forward` (Q6) | yes |
 | `--allow-mutations` | `RAY_MCP_ALLOW_MUTATIONS` | `false` | Register write tools | yes |
@@ -539,7 +585,10 @@ bomb that degrades the agent.
 - **Domain layer (bulk of coverage):** pure unit tests with fake `KubeRayPort`/
   `RayAPIPort`. Covers guards, the unified apply pipeline (RFC 7386 merge with
   rawSpec-wins, arrays-replace, identity guard, unstructured preservation), diff,
-  tier logic, and the submit→bounded-wait→follow orchestration (§7.A). No cluster
+  tier logic, the non-blocking submit + bounded `ray_job_wait` + status
+  distillation (§7.A, Q11), the **confirm-token** two-step on the destructive tier
+  and **`protected` self-gating** (removal refused without the token; Q9/Q10), and
+  the namespace-set gate ("not configured for namespace X"; Q12). No cluster
   required.
 - **KubeRay adapter:** `envtest` (controller-runtime's API-server-in-a-box) with
   KubeRay CRDs installed — exercises SSA, `DryRunAll`, and **pruning prediction**
@@ -552,6 +601,9 @@ bomb that degrades the agent.
 - **HTTP auth (Q8):** assert the **boot invariant** — non-loopback bind without a
   token (static or tokenreview) refuses to start; loopback is allowed tokenless;
   TokenReview path validated against a fake reviewer.
+- **Scope reconciliation (Q12):** with a fake `SelfSubjectAccessReview`, assert
+  `--allow-all-namespaces` without cluster-wide list refuses to start, and that
+  `ray_capabilities` reports the actually-served namespaces.
 - **MCP layer:** in-memory transport from go-sdk; assert tool schemas (including
   `rawSpec` absent when `--allow-raw-spec=false`, and `ray_job_stop` absent), arg
   validation, and end-to-end tool calls against fakes. Run across **both stdio and
@@ -633,6 +685,15 @@ the SDK repo. Confirmed:
 - **K8s TokenReview API (Q8):** lets a server validate a presented ServiceAccount
   token and obtain the caller's identity — the idiomatic in-cluster auth used for
   the opt-in `tokenreview` mode (cheaper than full OAuth for in-cluster).
+- **MCP tool annotations (Q9):** `readOnlyHint` / `destructiveHint` /
+  `idempotentHint` are part of the MCP tool spec; compliant clients use them to
+  decide when to auto-prompt the human — a free protocol-layer safety surface.
+- **K8s SelfSubjectAccessReview (Q12):** lets the server ask the API server "can I
+  do X?" at startup — used to reconcile `--allow-all-namespaces` against the SA's
+  real RBAC and fail loud instead of emitting per-call `Forbidden`s.
+- **In-cluster namespace (Q12):** a pod's own namespace is readable from the
+  mounted SA token dir (`/var/run/secrets/.../namespace`) — the basis for
+  defaulting to the pod's namespace rather than the literal `"default"`.
 
 ## 14. Open Questions / Future Work
 
@@ -669,6 +730,12 @@ Recorded so a reviewer can see *why* the chosen path won, not just what it is.
 | Transport scope (Q7) | Both stdio + HTTP in v1 | Defer HTTP+Helm to v1.1 | Guts the Helm chart's reason to exist, contradicts goal #5; the cheap part is plumbing and the costly part (auth) we design anyway. |
 | HTTP auth (Q8) | No-token only on loopback; token mandatory off-loopback; static + TokenReview | `--insecure` no-token mode | A tokenless network-reachable cluster-driver + autonomous agent is a loaded gun; remove the footgun entirely. |
 | HTTP auth (Q8) | TokenReview as the identity story | Full OAuth 2.1 now | TokenReview is the idiomatic, cheaper in-cluster realization; OAuth only if external-IdP demand appears. |
+| Mutation default (Q9) | `dryRun=false` + annotations + confirm-token on destructive | `dryRun=true` everywhere | Preview-by-default has a silent-non-action failure mode — agent sees "would create," believes it's done, never commits; actively misleads an autonomous agent. |
+| Mutation confirm (Q9) | Confirm-token on destructive tier only | Confirm-token on all writes | Server-held pending state + two-step is real cost; justified only for irreversible/traffic-affecting ops, not routine create/update. |
+| `protected` (Q10) | Keep, self-gate its removal, document as anti-fat-finger | Drop it / rely on RBAC only | "Don't accidentally delete prod" is genuinely useful for an agent-driven tool once confirm-token exists — provided it isn't oversold as security. |
+| `protected` (Q10) | Server-enforced annotation | API-server `finalizers` | Finalizers block kubectl too, but easily wedge resources into stuck states — too sharp a footgun for v1. |
+| Long-running ops (Q11) | Non-blocking + bounded `ray_job_wait` + distillation | Block-and-poll to completion | Hits the MCP client timeout on exactly the long jobs that matter; call dies, job runs on, agent thinks it failed — the #1 way the tool would feel broken. |
+| Namespace/RBAC (Q12) | Two explicit modes; SelfSubjectAccessReview reconciles flag↔RBAC | Always ship ClusterRole, gate ns at app level | Simpler Helm, but makes the least-privilege claim false by default — bad for the posture-B (donation/alignment) credibility. |
 
 ## 16. Project Posture, Survival Strategy & Standing Commitments (Q1/Q2)
 
