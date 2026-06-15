@@ -11,7 +11,7 @@ acceptance criteria + verification pass.
 lean and record it (don't silently guess, don't stall ungated work).
 
 ## Phase 0 — Foundation & Walking Skeleton
-- [ ] **Task 1** — Repo scaffold, module, lint, CI skeleton (S)
+- [x] **Task 1** — Repo scaffold, module, lint, CI skeleton (S) ✅ committed `2bd15a0` on `task-1-scaffold`
 - [ ] **Task 2** — Config layer: parsing + bind/auth boot invariants (M)
 - [ ] **Task 3** — Domain ports, types, error taxonomy, fakes (M)
 - [ ] **Task 4** — Walking skeleton: `ray_capabilities` over stdio (M) *(defers field-set report → re-homed to Task 9)*
