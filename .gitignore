@@ -1,0 +1,19 @@
+# Binaries
+/ray-mcp
+/bin/
+*.exe
+
+# Test / coverage output
+*.out
+coverage.*
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Editor / OS
+.DS_Store
+
+# Local planning artifacts (agent reads them; not shipped)
+/tasks/
+/AGENTS.md

@@ -171,7 +171,7 @@ decision.
 create/update/deploy tool; unifies Q3 SSA + Q4 pruning + #10 merge + #11 diff):
 1. Curated params → typed `RayCluster` → marshal to JSON (**base**).
 2. `rawSpec` (YAML|JSON) → JSON.
-3. **RFC 7386 JSON Merge Patch**, rawSpec over base (rawSpec wins). **Arrays
+3. **RFC 7396 JSON Merge Patch**, rawSpec over base (rawSpec wins). **Arrays
    replace wholesale**, documented loudly ("set `workerGroups` in rawSpec → you
    own the whole list"). Predictability > merge-by-key cleverness.
 4. **Identity guard:** merged result changing `name`/`namespace` away from

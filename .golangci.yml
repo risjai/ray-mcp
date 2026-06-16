@@ -1,0 +1,17 @@
+# golangci-lint v2 configuration. Run via `make lint` (pinned tool, see go.mod).
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - revive
+
+formatters:
+  enable:
+    - gofmt
