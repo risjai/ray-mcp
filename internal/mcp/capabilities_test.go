@@ -24,11 +24,13 @@ func (f fakeSource) ContextName() string      { return f.contextName }
 func (f fakeSource) DefaultNamespace() string { return f.defaultNamespace }
 
 // connect wires a server (built from cfg + src) to an in-memory client session.
+// The cluster tools require a KubeRayPort; these capabilities-focused tests do
+// not exercise it, so an empty fake suffices.
 func connect(t *testing.T, cfg *config.Config, src fakeSource) *mcp.ClientSession {
 	t.Helper()
 	ctx := context.Background()
 
-	server := mcpserver.NewServer(cfg, src)
+	server := mcpserver.NewServer(cfg, src, &fakeKubeRay{})
 	serverT, clientT := mcp.NewInMemoryTransports()
 
 	if _, err := server.Connect(ctx, serverT, nil); err != nil {

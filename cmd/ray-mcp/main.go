@@ -44,8 +44,13 @@ func run() int {
 		return 1
 	}
 
+	// Build the adapter WITHOUT dialing: the controller-runtime client is built
+	// lazily on the first ray_cluster_* call. This lets the server always boot —
+	// and the cluster-free ray_capabilities tool work — even when no kubeconfig
+	// can be resolved; cluster tools return a clean error if the cluster is
+	// unreachable.
 	adapter := kuberay.NewClient(cfg)
-	server := mcpserver.NewServer(cfg, adapter)
+	server := mcpserver.NewServer(cfg, adapter, adapter)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

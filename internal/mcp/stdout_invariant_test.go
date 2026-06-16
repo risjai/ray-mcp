@@ -43,7 +43,7 @@ func TestStdoutStaysClean(t *testing.T) {
 	// Logger wired exactly as main.go wires it: to stderr, never stdout.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	server := mcpserver.NewServer(cfg, stdoutFakeSource{})
+	server := mcpserver.NewServer(cfg, stdoutFakeSource{}, &fakeKubeRay{})
 	serverT, clientT := mcp.NewInMemoryTransports()
 	if _, err := server.Connect(ctx, serverT, nil); err != nil {
 		t.Fatalf("server.Connect: %v", err)

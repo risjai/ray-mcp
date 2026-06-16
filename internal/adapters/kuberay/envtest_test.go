@@ -360,6 +360,86 @@ func TestListClustersPagination(t *testing.T) {
 	}
 }
 
+// TestClusterServiceEndToEnd drives the DOMAIN ClusterService through the real
+// envtest-backed adapter (the adapter satisfies domain.ClusterReader). It proves
+// the full read path end-to-end: namespace defaulting, the distilled-vs-verbose
+// Raw gate, the "more available vs showing all" continue signal, and
+// NotFound propagation — all against a real apiserver, not a fake port.
+func TestClusterServiceEndToEnd(t *testing.T) {
+	adapter, k8s := startAdapter(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const namespace = "default"
+	names := []string{"svc-a", "svc-b", "svc-c"}
+	for _, name := range names {
+		if err := k8s.Create(ctx, newRayCluster(namespace, name)); err != nil {
+			t.Fatalf("create %q: %v", name, err)
+		}
+	}
+
+	svc := domain.NewClusterService(adapter, namespace)
+
+	// List with the default namespace (empty request namespace) returns the
+	// seeded clusters; with no Limit there is no continue token, so the honest
+	// signal is "showing all".
+	all, err := svc.List(ctx, domain.ClusterListRequest{})
+	if err != nil {
+		t.Fatalf("List (default namespace): %v", err)
+	}
+	if len(all.Items) != len(names) {
+		t.Fatalf("List returned %d clusters, want %d", len(all.Items), len(names))
+	}
+	if all.MoreAvailable {
+		t.Errorf("MoreAvailable = true with no page cap, want false (showing all)")
+	}
+
+	// Limit=1 forces pagination: the first page surfaces a continue token, so the
+	// signal flips to "more available".
+	page, err := svc.List(ctx, domain.ClusterListRequest{Limit: 1})
+	if err != nil {
+		t.Fatalf("List (Limit=1): %v", err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("List(Limit=1) returned %d items, want 1", len(page.Items))
+	}
+	if !page.MoreAvailable || page.Continue == "" {
+		t.Errorf("List(Limit=1) MoreAvailable=%v Continue=%q, want true + a token", page.MoreAvailable, page.Continue)
+	}
+
+	// Get distilled by default: Raw must be nil.
+	distilled, err := svc.Get(ctx, domain.ClusterGetRequest{Name: "svc-a"})
+	if err != nil {
+		t.Fatalf("Get (distilled): %v", err)
+	}
+	if distilled.Detail.Raw != nil {
+		t.Errorf("distilled Get Raw = %+v, want nil", distilled.Detail.Raw)
+	}
+	if distilled.Detail.Name != "svc-a" {
+		t.Errorf("distilled Get Name = %q, want svc-a", distilled.Detail.Name)
+	}
+
+	// Get verbose: Raw must carry the full object.
+	verbose, err := svc.Get(ctx, domain.ClusterGetRequest{Name: "svc-a", Verbose: true})
+	if err != nil {
+		t.Fatalf("Get (verbose): %v", err)
+	}
+	if verbose.Detail.Raw == nil {
+		t.Fatalf("verbose Get Raw = nil, want the full object")
+	}
+	if kind, _ := verbose.Detail.Raw["kind"].(string); kind != "RayCluster" {
+		t.Errorf("verbose Get Raw[kind] = %q, want RayCluster", kind)
+	}
+
+	// NotFound propagates through the service unchanged.
+	_, err = svc.Get(ctx, domain.ClusterGetRequest{Name: "does-not-exist"})
+	var nf *domain.NotFoundError
+	if !errors.As(err, &nf) {
+		t.Fatalf("Get(missing) error = %T (%v), want *domain.NotFoundError", err, err)
+	}
+}
+
 // cond builds a metav1.Condition with the fields the mapping reads. LastTransitionTime
 // is required by the apiserver when writing conditions.
 func cond(condType string, status metav1.ConditionStatus, reason, message string) metav1.Condition {

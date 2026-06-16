@@ -30,19 +30,28 @@ type fakeKubeRay struct {
 	events   map[string][]Event
 
 	applied MergedSpec // last spec passed to Apply.
+
+	// listClustersContinue, when set, is returned verbatim as the ClusterList
+	// continue token so a test can drive the "more available" signal without a
+	// real paginating backend. lastListOpts captures the options the service
+	// passed through (to assert namespace defaulting / allNamespaces).
+	listClustersContinue string
+	lastListOpts         ListOptions
 }
 
 func key(namespace, name string) string { return namespace + "/" + name }
 
-func (f *fakeKubeRay) ListClusters(_ context.Context, namespace string, _ ListOptions) (ClusterList, error) {
+func (f *fakeKubeRay) ListClusters(_ context.Context, namespace string, opts ListOptions) (ClusterList, error) {
+	f.lastListOpts = opts
+
 	var items []ClusterSummary
 	for _, c := range f.clusters {
-		if c.Namespace == namespace {
+		if opts.AllNamespaces || c.Namespace == namespace {
 			items = append(items, c.ClusterSummary)
 		}
 	}
 
-	return ClusterList{Items: items, Continue: ""}, nil
+	return ClusterList{Items: items, Continue: f.listClustersContinue}, nil
 }
 
 func (f *fakeKubeRay) GetCluster(_ context.Context, namespace, name string) (ClusterDetail, error) {
