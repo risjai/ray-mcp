@@ -34,6 +34,12 @@ to stderr.
 To connect ray-mcp to Claude Desktop, Claude Code, Cursor, or any MCP client — and
 to verify the connection by hand — see **[docs/INSTALL.md](docs/INSTALL.md)**.
 
+## Architecture
+
+For the layers, ports, data flows, and diagrams (what's built vs. designed), see
+**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**. The authoritative design spec is
+[docs/specs/ray-mcp-design.md](docs/specs/ray-mcp-design.md).
+
 ## Testing
 
 A five-tier pyramid; the fast loop needs no Docker:
