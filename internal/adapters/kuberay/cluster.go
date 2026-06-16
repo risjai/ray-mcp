@@ -34,6 +34,11 @@ const dashboardPort = 8265
 // domain can report "N shown, continue token X" rather than silently truncating
 // (spec §10).
 func (c *Client) ListClusters(ctx context.Context, namespace string, opts domain.ListOptions) (domain.ClusterList, error) {
+	k8s, err := c.ensureClient()
+	if err != nil {
+		return domain.ClusterList{}, err
+	}
+
 	limit := opts.Limit
 	if limit <= 0 {
 		limit = defaultListLimit
@@ -50,7 +55,7 @@ func (c *Client) ListClusters(ctx context.Context, namespace string, opts domain
 	}
 
 	var rcl rayv1.RayClusterList
-	if err := c.k8s.List(ctx, &rcl, listOpts...); err != nil {
+	if err := k8s.List(ctx, &rcl, listOpts...); err != nil {
 		return domain.ClusterList{}, mapK8sError(err, "list", domain.KindRayCluster, namespace, "")
 	}
 
@@ -68,8 +73,13 @@ func (c *Client) ListClusters(ctx context.Context, namespace string, opts domain
 // GetCluster returns the distilled detail for one RayCluster, including the full
 // object under Raw for the verbose/raw escape hatch.
 func (c *Client) GetCluster(ctx context.Context, namespace, name string) (domain.ClusterDetail, error) {
+	k8s, err := c.ensureClient()
+	if err != nil {
+		return domain.ClusterDetail{}, err
+	}
+
 	var rc rayv1.RayCluster
-	if err := c.k8s.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &rc); err != nil {
+	if err := k8s.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &rc); err != nil {
 		return domain.ClusterDetail{}, mapK8sError(err, "get", domain.KindRayCluster, namespace, name)
 	}
 

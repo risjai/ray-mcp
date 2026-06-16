@@ -4,11 +4,12 @@ This guide walks through building `ray-mcp` and connecting it to an MCP-capable
 AI agent (Claude Desktop, Claude Code, Cursor, or any MCP client). It also shows
 how to verify the connection by hand.
 
-> **Status:** early development. Today the server exposes one read-only tool,
-> `ray_capabilities`, over the **stdio** transport. RayCluster read tools
-> (`ray_cluster_list`/`ray_cluster_get`) and the rest are being added
-> iteratively. HTTP transport arrives later. The install steps below won't change
-> as tools are added — you point your agent at the same binary.
+> **Status:** early development. Today the server exposes three read-only tools
+> over the **stdio** transport: `ray_capabilities` (server/binding info, no cluster
+> call), and `ray_cluster_list` / `ray_cluster_get` (read your RayClusters). Job and
+> service tools, and write/destructive tiers, are being added iteratively. HTTP
+> transport arrives later. The install steps below won't change as tools are added —
+> you point your agent at the same binary.
 
 ## 1. Build the binary
 
@@ -39,9 +40,12 @@ echo "$(pwd)/ray-mcp"
 Read tools are always on. By default the server is **read-only** — you must opt
 into mutations explicitly. Full flag reference: design spec §9.
 
-> The server binds **one kubeconfig context at startup** and talks to that
-> cluster. Make sure the context/kubeconfig you pass can reach your cluster
-> (`kubectl --context <name> get pods` should work).
+> The server **always boots**, even with no reachable cluster — so your agent
+> always connects and `ray_capabilities` always works. The cluster connection is
+> made **lazily**, on the first `ray_cluster_*` call; if the kubeconfig can't reach
+> a cluster, those tools return a clean error (and retry once it's fixed — no
+> restart needed). Point `--context`/`--kubeconfig` at a context where
+> `kubectl --context <name> get rayclusters` works.
 
 ## 3. Connect your agent
 
