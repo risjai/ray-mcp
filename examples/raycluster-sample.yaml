@@ -1,0 +1,52 @@
+# A minimal RayCluster sized to run on a laptop kind cluster.
+#
+# Apply it with:   kubectl apply -f examples/raycluster-sample.yaml
+# Watch it:        kubectl get raycluster ray-sample -w
+# Delete it:       kubectl delete -f examples/raycluster-sample.yaml
+#
+# One head + one worker, modest CPU/memory requests so it schedules on a single
+# kind node. Autoscaling is off to keep things predictable. The image is the
+# upstream Ray release; the first pull is large (~GBs) and can take several
+# minutes — that is normal.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: ray-sample
+spec:
+  rayVersion: "2.9.0"
+  headGroupSpec:
+    rayStartParams: {}
+    template:
+      spec:
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.9.0
+            resources:
+              requests:
+                cpu: "500m"
+                memory: "1Gi"
+              limits:
+                cpu: "1"
+                memory: "2Gi"
+            ports:
+              - { containerPort: 6379, name: gcs }
+              - { containerPort: 8265, name: dashboard }
+              - { containerPort: 10001, name: client }
+  workerGroupSpecs:
+    - groupName: small-workers
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 1
+      rayStartParams: {}
+      template:
+        spec:
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.9.0
+              resources:
+                requests:
+                  cpu: "500m"
+                  memory: "1Gi"
+                limits:
+                  cpu: "1"
+                  memory: "2Gi"
