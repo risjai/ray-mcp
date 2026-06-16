@@ -44,7 +44,7 @@ flowchart TB
     end
 
     subgraph adapters["Adapters — internal/adapters"]
-        kr["kuberay: controller-runtime client<br/>(SSA + DryRunAll) — read path built"]
+        kr["kuberay: controller-runtime client<br/>read path built; SSA + DryRunAll planned"]
         api["rayapi: dashboard/job REST<br/>read-only — planned"]
         reach["reachability: DirectDial / PortForward<br/>— planned"]
     end
@@ -73,6 +73,13 @@ flowchart TB
 the port interfaces; adapters depend on the domain to implement them. The domain
 imports neither `k8s.io/*` nor `net/http` — enforced in CI by an import check
 (`go list -deps ./internal/domain` must not pull those).
+
+> **Interface segregation.** A service depends on the *narrowest* slice of a port
+> it needs, not the whole interface. `ClusterService` depends on `ClusterReader`
+> (just `ListClusters` + `GetCluster`), not the full `KubeRayPort` — so the adapter
+> can implement capabilities incrementally, fakes stay minimal, and `NewServer`
+> wires `domain.ClusterReader`. The diagram's `svc → ports` arrow is a
+> simplification of this. See [The three ports](#the-three-ports).
 
 ## Package layout
 
@@ -120,6 +127,13 @@ flowchart LR
 `internal/adapters/kuberay`; everything MCP-protocol-shaped lives in `internal/mcp`
 and `internal/transport`.
 
+**Adding a tool**, mechanically, is one call: `mcp.AddTool(server, &mcp.Tool{Name,
+Description, Annotations}, handler)` with typed input/output structs (the go-sdk
+derives the JSON schema from the struct and validates args before the handler
+runs). The handler maps the decoded input to a domain request, calls the service,
+and returns a `CallToolResult` carrying both `StructuredContent` and a short text
+summary. See `addClusterTools` in `internal/mcp/cluster.go`.
+
 ## The three ports
 
 The domain depends on exactly three interfaces (`internal/domain/ports.go`). Each
@@ -136,6 +150,14 @@ method, and that absence *is* the contract: the Ray dashboard is unauthenticated
 by default (the "ShadowRay" RCE surface), so ray-mcp consumes it read-only and
 never exposes it as a write vector. Every mutation goes through the guarded CRD
 path (`KubeRayPort`), not here.
+
+**Services consume narrow slices, not whole ports.** A service declares its own
+minimal interface and the adapter (which implements the full port) satisfies it.
+`ClusterService` depends on `ClusterReader` — `ListClusters` + `GetCluster` only —
+defined in `internal/domain/cluster.go`. This is why the RayCluster read tools work
+today even though the kuberay adapter implements only the read slice of
+`KubeRayPort`: the rest of the port (Apply/Delete/Events/jobs/services) is declared
+but not yet implemented, and nothing depends on the unimplemented methods.
 
 ## Data flow — a built tool call (`ray_cluster_list`)
 
@@ -154,8 +176,8 @@ sequenceDiagram
     participant K as Kubernetes API
 
     Agent->>T: tools/call ray_cluster_list {namespace, limit, continue}
-    T->>M: decoded request
-    M->>M: validate args → ClusterListRequest
+    T->>M: decoded request<br/>(go-sdk validated args vs schema)
+    M->>M: build ClusterListRequest from input
     M->>S: List ctx, req
     S->>S: resolve default namespace
     S->>A: ListClusters ctx, ns, opts
@@ -276,7 +298,29 @@ flowchart TB
 ```
 
 The server is **stateless** — confirmations are content-derived fingerprints, not
-server-issued tokens, so the HTTP deployment stays horizontally scalable.
+server-issued tokens, so the planned HTTP deployment will be horizontally
+scalable. The tier system is gated at tool *registration* time, but note that
+today, with only read tools built, `NewServer` registers everything
+unconditionally — the registration gate is wired when the first write tool lands
+(Task 8b).
+
+## Concurrency & state
+
+ray-mcp holds almost no mutable state, by design:
+
+- **Request-scoped, no sessions.** Each tool call is self-contained; nothing is
+  cached across calls and there are no server-issued session/confirm tokens
+  (confirmations are content-derived fingerprints). This is what keeps the future
+  HTTP transport horizontally scalable.
+- **The one piece of shared mutable state** is the lazily-built controller-runtime
+  client in the kuberay adapter, guarded by a `sync.Mutex` (`ensureClient`): the
+  first cluster call builds it, concurrent first-callers serialize on the lock, a
+  success is cached, a failure is not (so a fixed kubeconfig is retried).
+- **Transport concurrency:** stdio processes one request at a time; the planned
+  HTTP transport can serve concurrent calls, which the stateless design already
+  supports (the adapter's mutex is the only thing that needs to be safe, and is).
+- **One instance binds one Kubernetes context** at startup; multi-namespace within
+  that context.
 
 ## Configuration & transports
 
@@ -307,6 +351,11 @@ The fast loop needs no Docker; build tags isolate the heavier tiers.
 Because tiers 2–4 are blind to the wedge end-to-end (no operator, faked
 dashboard), the kind+KubeRay e2e tier is the truth gate for the differentiator —
 run as a pre-push capstone, not in the per-save loop.
+
+Tests live **alongside their package** per Go convention (e.g.
+`internal/domain/cluster_test.go`, `internal/mcp/cluster_test.go`); `envtest` and
+`e2e` files carry the matching build tag, and only the e2e tier lives separately
+under `test/e2e/`.
 
 ## Build status snapshot
 
