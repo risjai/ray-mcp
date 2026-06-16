@@ -1,7 +1,7 @@
 # Implementation Plan: ray-mcp
 
 **Date:** 2026-06-13
-**Source of truth:** `docs/superpowers/specs/2026-06-13-ray-mcp-design.md` (Q1–Q15 decided; Q16 schema ratified, behavior open)
+**Source of truth:** `docs/specs/ray-mcp-design.md` (Q1–Q15 decided; Q16 schema ratified, behavior open)
 **Status:** Draft for human review — no code written yet
 
 ## Overview
@@ -37,7 +37,7 @@ also lean on; building them first avoids rework.
   `RayAPIPort`, `RayReachability` interfaces. Fakes drive the bulk of tests.
 - **KubeRay access** = controller-runtime *client package* (uncached) + KubeRay
   Go types; all mutations via **Server-Side Apply** preceded by `DryRunAll`.
-- **rawSpec wins** over curated params via RFC 7386 JSON Merge Patch; merged
+- **rawSpec wins** over curated params via RFC 7396 JSON Merge Patch; merged
   object stays **unstructured** (preserves newer-than-baseline fields).
 - **Dashboard API is read-only by construction** (`RayAPIPort` has no write
   methods); reached via `RayReachability` (DirectDial in-cluster, pooled SPDY
@@ -256,7 +256,7 @@ truncation marker).
 
 #### Task 8a: Merge + diff core (pure, no cluster)
 **Description:** The pure, I/O-free heart of the pipeline: curated→typed→JSON
-base, RFC 7386 merge (rawSpec wins, arrays replace wholesale), identity guard,
+base, RFC 7396 merge (rawSpec wins, arrays replace wholesale), identity guard,
 unstructured result, and §10 field-level diff summarization. No k8s calls.
 
 **Acceptance criteria:**
@@ -381,7 +381,7 @@ not self-approved by the implementing agent; `go test ./internal/domain/...`.
 *gates* Tasks 16/17/20, so although it can start as early as Task 3 (in parallel
 with Tasks 5–12), it must **complete before the wedge tools** — schedule it early,
 not as a fill-in. If it slips, the wedge slips (F11).
-**Files:** `docs/superpowers/specs/2026-06-13-ray-mcp-status-distillation.md`, `internal/domain/distill.go`, `internal/domain/distill_test.go`.
+**Files:** `docs/specs/ray-mcp-status-distillation.md`, `internal/domain/distill.go`, `internal/domain/distill_test.go`.
 
 #### Task 14: `RayReachability` adapter (DirectDial + pooled PortForward)
 **Description:** Strategy selection (`auto`/`direct`/`port-forward`), in-cluster

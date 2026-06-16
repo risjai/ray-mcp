@@ -1,7 +1,7 @@
 # ray-mcp — Task Checklist
 
 Companion to `tasks/plan.md`. Source of truth: the design spec
-(`docs/superpowers/specs/2026-06-13-ray-mcp-design.md`). Check tasks off as
+(`docs/specs/ray-mcp-design.md`). Check tasks off as
 acceptance criteria + verification pass.
 
 **Conventions (see plan.md → Conventions):** Scope = effort+risk legend
@@ -28,7 +28,7 @@ lean and record it (don't silently guess, don't stall ungated work).
 - [ ] **B2** — keep CRD-schema-read + its ClusterRole, or demote to optional (DryRunAll covers pruning) — outcome shapes Task 9's field-set report + Task 26 RBAC
 
 ## Phase 2 — Apply pipeline + RayCluster write
-- [ ] **Task 8a** — Merge + diff core, pure/no-cluster (RFC 7386 rawSpec-wins, identity guard, §10 diff) (M)
+- [ ] **Task 8a** — Merge + diff core, pure/no-cluster (RFC 7396 rawSpec-wins, identity guard, §10 diff) (M)
 - [ ] **Task 8b** — Apply orchestration (DryRunAll → SSA → read-back diff) **+ mutation audit hook** (M)
 - [ ] **Task 9** — `ray_cluster_create` end-to-end + pruning detection **+ delivers Task 4's deferred capabilities field-set** (M)
 - [ ] 🚪 **Decision Gate 2a (before Task 10)** — **B3:** does scale-to-zero need `--allow-destructive`, or only runtime confirm?

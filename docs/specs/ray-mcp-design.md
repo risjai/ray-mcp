@@ -138,7 +138,7 @@ use. Distribution polish (§12) is justified by, and sequenced after, the wedge.
 | 7 | HTTP auth | **Non-loopback bind ⇒ token mandatory, no bypass** (Q8; `--insecure` killed). Default bind `127.0.0.1`. Static bearer (default) + K8s **TokenReview** (opt-in, built in v1). TLS to ingress/mesh. Audit-log every mutation | yes |
 | 8 | K8s client | controller-runtime **client package** (`pkg/client`, uncached, direct-to-API) + KubeRay Go types/scheme (`ray-operator/apis/ray/v1`); SSA (`client.Apply`) + `DryRunAll`. NOT the manager framework, NOT the generated clientset (Q3) | yes |
 | 9 | MCP SDK | Official `github.com/modelcontextprotocol/go-sdk` (**GA v1.6.1, verified**; stdio + streamable-HTTP, tool annotations, structuredContent, in-memory test transport all present — §13/§14) | yes |
-| 10 | Spec input | Curated typed params + `rawSpec` escape hatch via **RFC 7386 JSON Merge Patch, rawSpec-over-curated (rawSpec wins)**, arrays replace wholesale, identity-guarded, applied **unstructured**; `--allow-raw-spec` gate (Q5) | yes |
+| 10 | Spec input | Curated typed params + `rawSpec` escape hatch via **RFC 7396 JSON Merge Patch, rawSpec-over-curated (rawSpec wins)**, arrays replace wholesale, identity-guarded, applied **unstructured**; `--allow-raw-spec` gate (Q5) | yes |
 | 11 | Safety model | Layered: tier flags + MCP tool annotations + dryRun(default false) + **confirm-fingerprint on destructive tier** + self-gating `protected` annotation + diffs + RBAC floor (Q9/Q10) | yes |
 | 12 | KubeRay version | `ray.io/v1` only (no v1alpha1); compile against latest GA KubeRay at first commit (v1.5.x as of 2026-06), bump deliberately; **read the installed Ray CRD schema** for pruning prediction + best-effort version; CI-tested range in README (Q4) | yes |
 | 13 | Logs | Bounded tail (last-N-lines / since-duration), not streaming | yes |
@@ -164,7 +164,7 @@ it depends on Go interfaces — which makes it unit-testable with fakes.
 │   • ClusterService · JobService · ServiceService               │
 │   • safety guards: mutation gate, destructive gate, dryRun,    │
 │     protected-annotation, before/after diff                    │
-│   • unified apply pipeline: curated base + rawSpec (RFC 7386,  │
+│   • unified apply pipeline: curated base + rawSpec (RFC 7396,  │
 │     rawSpec wins) → unstructured → DryRunAll → SSA (§7.C)       │
 │   • orchestration: submit → bounded-wait/poll across both APIs │
 ├──────────────────────────────────────────────────────────────┤
@@ -313,7 +313,7 @@ plus `rawSpec` (YAML/JSON, merged **over** the curated base — see below).
 **`rawSpec` is the deliberate escape hatch (Q5 — rawSpec wins).** Curated params
 are the convenient common-case shape; `rawSpec` is the power-user scalpel and it
 **takes precedence**. Mechanics (the unified apply pipeline, §7.C): the curated
-params form the **base**, `rawSpec` is applied over it as an **RFC 7386 JSON Merge
+params form the **base**, `rawSpec` is applied over it as an **RFC 7396 JSON Merge
 Patch (rawSpec wins on any key collision)**, **arrays replace wholesale** (set
 `workerGroups` in `rawSpec` and you own the entire list — documented loudly), and
 an **identity guard** rejects any merged result that changes `name`/`namespace`
@@ -386,7 +386,7 @@ sequenceDiagram
 
     Agent->>+MCP: ray_job_submit(entrypoint, target)
     MCP->>+Svc: SubmitJobRequest (validated)
-    Note over Svc: mutation gate.<br>build RayJob (rawSpec over<br>curated, RFC 7386).<br>DryRunAll then SSA
+    Note over Svc: mutation gate.<br>build RayJob (rawSpec over<br>curated, RFC 7396).<br>DryRunAll then SSA
     Svc->>+K8s: SSA-apply RayJob (ray.io/v1)
     K8s-->>-Svc: accepted (name)
     Svc-->>-MCP: {name, jobId-when-ready, initialStatus}
@@ -443,7 +443,7 @@ detection (Q4), the `rawSpec` merge (#10), and the diff (#11):
 
 1. Curated params → typed KubeRay object → marshal to JSON (**base**).
 2. `rawSpec` (YAML or JSON) → JSON.
-3. **RFC 7386 JSON Merge Patch**, `rawSpec` over base (**rawSpec wins**); arrays
+3. **RFC 7396 JSON Merge Patch**, `rawSpec` over base (**rawSpec wins**); arrays
    replace wholesale.
 4. **Identity guard:** if the merged result changes `name`/`namespace` away from
    the tool-arg identity → **error**, not silent ignore.
@@ -631,7 +631,7 @@ hatches so the agent can ask for more but can never un-spend forced tokens.
 ## 11. Testing Strategy
 
 - **Domain layer (bulk of coverage):** pure unit tests with fake `KubeRayPort`/
-  `RayAPIPort`. Covers guards, the unified apply pipeline (RFC 7386 merge with
+  `RayAPIPort`. Covers guards, the unified apply pipeline (RFC 7396 merge with
   rawSpec-wins, arrays-replace, identity guard, unstructured preservation), diff,
   tier logic, the non-blocking submit + bounded `ray_job_wait` + status
   distillation (§7.A, Q11), the **confirm-fingerprint** two-step on the destructive tier
