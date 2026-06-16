@@ -13,3 +13,6 @@ go.work.sum
 
 # Editor / OS
 .DS_Store
+
+# Local planning artifacts (agent reads them; not shipped)
+/tasks/
