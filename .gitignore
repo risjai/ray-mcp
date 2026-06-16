@@ -16,3 +16,4 @@ go.work.sum
 
 # Local planning artifacts (agent reads them; not shipped)
 /tasks/
+/AGENTS.md
