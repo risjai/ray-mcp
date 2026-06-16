@@ -9,6 +9,10 @@ This document operationalizes spec §11. It does not replace it — it adds the
 runnable mechanics: a five-tier test pyramid, a per-task runnable test manifest
 format, and a real-cluster (kind + KubeRay) e2e harness used as a pre-push gate.
 
+> **Contributors:** for the practical "how do I test before adding a tool /
+> raising a PR" workflow, start with [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
+> This document is the *why* behind the tiers; CONTRIBUTING.md is the *how*.
+
 ## Why this exists
 
 Spec §11 already names the right substrates (fakes, `envtest`, `httptest`,
