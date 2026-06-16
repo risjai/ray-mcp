@@ -22,8 +22,13 @@ You said you already have these — quick checks so we fail early, not midway:
 ```sh
 docker info        # Docker must be RUNNING (you'll see server info, not an error)
 kubectl version --client   # any recent kubectl
-go version         # need Go 1.26+ to build ray-mcp
+go version         # need Go 1.26.3+ — if yours is lower, `go build` fails with a toolchain error
 ```
+
+> **Apple Silicon Mac?** The Ray image (step 4) is published for `linux/amd64`
+> only, so it runs under Docker Desktop emulation — slower and more memory-hungry.
+> Give Docker Desktop **≥ 6 GB RAM** (Settings → Resources) or the worker pod can
+> OOM / `CrashLoopBackOff`. On Intel Macs / Linux this isn't a concern.
 
 Two more small tools. Install with Homebrew (macOS) or your package manager:
 
@@ -173,11 +178,16 @@ context (`kubectl config current-context`).
 Register ray-mcp as an MCP server (use the absolute path from step 1):
 
 ```sh
-claude mcp add ray-mcp /absolute/path/to/ray-mcp -- --context kind-ray-demo --default-namespace default
+claude mcp add --scope user ray-mcp /absolute/path/to/ray-mcp -- --context kind-ray-demo --default-namespace default
 ```
 
 > The `--` separates Claude Code's own flags from ray-mcp's flags. Everything
 > after `--` is passed to the ray-mcp binary.
+>
+> **Why `--scope user`?** Without it, `claude mcp add` defaults to `local` scope,
+> which registers the server **only for the directory you ran the command in** — so
+> starting Claude Code anywhere else won't show the tools (and the prompts in step 7
+> silently do nothing). `--scope user` makes ray-mcp available in every directory.
 
 Verify Claude Code sees it:
 
@@ -230,24 +240,33 @@ That removes the cluster, the operator, and the sample Ray cluster in one go.
 Uninstall the Claude Code MCP entry if you like:
 
 ```sh
-claude mcp remove ray-mcp
+claude mcp remove --scope user ray-mcp
 ```
+
+> Match the scope you added with. If you used `--scope user` in step 6, remove with
+> `--scope user` (as above). If you skipped it (default `local`), run `claude mcp
+> remove ray-mcp` from the **same directory** you added it in, or it reports
+> `No MCP server found`.
 
 ---
 
 ## Troubleshooting
 
 - **`docker info` errors** → Docker Desktop isn't running. Start it, retry.
-- **Ray pods stuck `Pending` / `ContainerCreating` for a long time** → still
-  pulling the image (it's big) or your Docker VM is low on memory. Give Docker
-  Desktop ≥ 4 GB RAM. `kubectl describe pod <name>` shows the reason at the bottom.
+- **Ray pods stuck `Pending` / `ContainerCreating`, or worker `CrashLoopBackOff` /
+  OOMKilled** → still pulling the (big) image, or your Docker VM is low on memory —
+  more likely on Apple Silicon where the amd64 image runs emulated. Give Docker
+  Desktop **≥ 6 GB RAM**. `kubectl describe pod <name>` shows the reason at the bottom.
 - **ray-mcp says "cannot reach cluster"** → the context is wrong or the cluster is
   down. Check `kubectl config current-context` (should be `kind-ray-demo`) and
   `kubectl get raycluster`. ray-mcp dials lazily, so fix the kubeconfig and just
   call the tool again — no restart needed.
-- **Claude Code doesn't show the tools** → `claude mcp list` to confirm it's
-  registered; make sure you used the **absolute** path to the binary. Run the
-  step-5 by-hand check to isolate whether it's ray-mcp or the Claude Code wiring.
+- **Claude Code doesn't show the tools** → first, `claude mcp list` to confirm it's
+  registered. If it's missing, the usual cause is **scope**: a default
+  `claude mcp add` (no `--scope user`) only registers for the directory you ran it
+  in, so the tools won't appear elsewhere — re-add with `--scope user` (step 6).
+  Also make sure you used the **absolute** path to the binary. Run the step-5
+  by-hand check to isolate whether it's ray-mcp or the Claude Code wiring.
 - **`ray_capabilities` works but `ray_cluster_list` errors** → that's the
   lazy-dial behavior: capabilities needs no cluster, list does. The error means
   the cluster isn't reachable — see above.
