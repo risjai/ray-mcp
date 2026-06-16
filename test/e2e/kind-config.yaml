@@ -1,0 +1,9 @@
+# Minimal kind cluster for the ray-mcp e2e tier (tier 5). A single control-plane
+# node is enough to run the KubeRay operator and a small Ray cluster for smoke
+# tests. `make e2e-up` creates the cluster from this config and installs the
+# KubeRay operator (pinned to KUBERAY_VERSION) on top.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ray-mcp-e2e
+nodes:
+  - role: control-plane
