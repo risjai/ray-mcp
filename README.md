@@ -1,9 +1,18 @@
 # ray-mcp
 MCP server for managing Ray Clusters and Jobs. Written in Go for native k8s support.
 
-> **Status:** early development. The walking skeleton runs today: a single
-> read-only `ray_capabilities` tool over the stdio transport. Cluster/job/service
-> tools are being added iteratively.
+> **Status:** early development. Today the server exposes three read-only tools over
+> the stdio transport — `ray_capabilities`, `ray_cluster_list`, and
+> `ray_cluster_get`. Write/destructive tiers and Ray job/service tools are being
+> added iteratively.
+
+## 🚀 Try it end-to-end
+
+New here and want to see it work? **[docs/TRY-IT-WITH-CLAUDE-CODE.md](docs/TRY-IT-WITH-CLAUDE-CODE.md)**
+is a zero-to-Claude-Code walkthrough: spin up a local Kubernetes cluster (kind),
+install KubeRay, create a sample Ray cluster, build ray-mcp, and ask Claude Code
+about your cluster — no prior Ray knowledge needed. Needs Docker + kubectl + Go +
+Claude Code. ~20–30 min, fully disposable.
 
 ## Quickstart (skeleton)
 
@@ -14,7 +23,9 @@ go build -o ray-mcp ./cmd/ray-mcp
 
 `ray_capabilities` reports the server version, bound kubeconfig context, default
 namespace, enabled tool tiers, and the CI-tested KubeRay version — no live cluster
-call. Write tools register only with `--allow-mutations` (and `--allow-destructive`
+call. `ray_cluster_list` / `ray_cluster_get` read RayClusters from the bound cluster
+(dialed lazily on first use, so the server boots even with no cluster reachable).
+Write tools register only with `--allow-mutations` (and `--allow-destructive`
 for the destructive tier). Under stdio, **stdout is the JSON-RPC wire**; all logs go
 to stderr.
 
