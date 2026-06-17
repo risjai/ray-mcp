@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -66,9 +67,37 @@ type ClusterGetOutput struct {
 	Raw             map[string]any `json:"raw,omitempty" jsonschema:"the full unstructured object; present only when verbose=true"`
 }
 
-// addClusterTools registers ray_cluster_list and ray_cluster_get against the
-// domain ClusterService. Both are read-only; the handlers do validation +
-// mapping only, with all read policy living in the service.
+// clusterEventsInput is the ray_cluster_events argument object. Name is required;
+// namespace defaults to the server default; limit caps the returned events.
+type clusterEventsInput struct {
+	Name      string `json:"name"                jsonschema:"the RayCluster name (required)"`
+	Namespace string `json:"namespace,omitempty" jsonschema:"namespace of the RayCluster; defaults to the server default namespace"`
+	Limit     int    `json:"limit,omitempty"     jsonschema:"max events to return; 0 uses the server default (~25). Warnings are prioritized over Normal events when trimming"`
+}
+
+// eventRow is one bounded event in the structured output (spec §10: a relevant
+// slice, never the raw firehose). AgeSeconds is the time since LastSeen so the
+// agent reads recency without parsing timestamps.
+type eventRow struct {
+	Type       string `json:"type"`
+	Reason     string `json:"reason"`
+	Message    string `json:"message"`
+	Count      int32  `json:"count"`
+	AgeSeconds int64  `json:"ageSeconds"`
+}
+
+// ClusterEventsOutput is the structured ray_cluster_events result: the bounded
+// event rows plus the count and warning count for the text summary.
+type ClusterEventsOutput struct {
+	Events   []eventRow `json:"events"   jsonschema:"recent, bounded events for the cluster + its pods, Warnings first then most recent"`
+	Count    int        `json:"count"    jsonschema:"the number of events returned (after bounding)"`
+	Warnings int        `json:"warnings" jsonschema:"how many of the returned events are Warnings"`
+}
+
+// addClusterTools registers ray_cluster_list, ray_cluster_get and
+// ray_cluster_events against the domain ClusterService. All are read-only; the
+// handlers do validation + mapping only, with all read policy living in the
+// service.
 func addClusterTools(server *mcp.Server, svc *domain.ClusterService) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "ray_cluster_list",
@@ -114,6 +143,75 @@ func addClusterTools(server *mcp.Server, svc *domain.ClusterService) {
 			Content: []mcp.Content{&mcp.TextContent{Text: clusterGetSummary(out)}},
 		}, out, nil
 	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ray_cluster_events",
+		Description: "Recent, bounded Kubernetes events for a RayCluster — operator/reconcile events on the cluster object merged with scheduler/kubelet events on its pods (FailedScheduling, ErrImagePull, OOMKilled, ...), Warnings first then most recent. A relevant slice, never the raw event firehose. Read-only.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in clusterEventsInput) (*mcp.CallToolResult, ClusterEventsOutput, error) {
+		if in.Name == "" {
+			return nil, ClusterEventsOutput{}, errors.New("name is required")
+		}
+
+		res, err := svc.Events(ctx, domain.ClusterEventsRequest{
+			Namespace: in.Namespace,
+			Name:      in.Name,
+			Limit:     in.Limit,
+		})
+		if err != nil {
+			return nil, ClusterEventsOutput{}, mapClusterGetError(err) //nolint:wrapcheck // mapped to a clean, bounded tool error.
+		}
+
+		out := toClusterEventsOutput(res)
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: clusterEventsSummary(res, out)}},
+		}, out, nil
+	})
+}
+
+// toClusterEventsOutput maps the domain events result to the structured output,
+// computing the per-event age and the warning count for the summary.
+func toClusterEventsOutput(res domain.ClusterEventsResult) ClusterEventsOutput {
+	rows := make([]eventRow, 0, len(res.Events))
+	warnings := 0
+	for _, e := range res.Events {
+		if e.Type == "Warning" {
+			warnings++
+		}
+		rows = append(rows, eventRow{
+			Type:       e.Type,
+			Reason:     e.Reason,
+			Message:    e.Message,
+			Count:      e.Count,
+			AgeSeconds: eventAgeSeconds(e.LastSeen),
+		})
+	}
+	return ClusterEventsOutput{Events: rows, Count: len(rows), Warnings: warnings}
+}
+
+// eventAgeSeconds reports the time since an event was last seen, guarding a zero
+// timestamp (no resolvable lastSeen) so it never reports a multi-decade age.
+func eventAgeSeconds(lastSeen time.Time) int64 {
+	if lastSeen.IsZero() {
+		return 0
+	}
+	return int64(time.Since(lastSeen).Seconds())
+}
+
+// clusterEventsSummary renders the one-line human-readable text content. An empty
+// list must NOT read as "healthy": k8s expires events after ~1h, so absence is
+// silence, not a clean bill of health — the text says so explicitly.
+func clusterEventsSummary(res domain.ClusterEventsResult, out ClusterEventsOutput) string {
+	if out.Count == 0 {
+		return fmt.Sprintf(
+			"no recent events for %q in namespace %q (Kubernetes expires events after ~1h, so this is not a clean bill of health)",
+			res.Name, res.Namespace,
+		)
+	}
+	return fmt.Sprintf(
+		"%d recent events for %q in namespace %q (%d warnings)",
+		out.Count, res.Name, res.Namespace, out.Warnings,
+	)
 }
 
 // toClusterListOutput maps the domain list result to the structured output.

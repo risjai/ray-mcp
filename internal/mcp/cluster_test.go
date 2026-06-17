@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -18,6 +19,7 @@ import (
 type fakeKubeRay struct {
 	clusters   map[string]domain.ClusterDetail
 	continueTo string
+	events     map[string][]domain.Event
 }
 
 // compile-time proof the fake satisfies the narrow port NewServer takes.
@@ -41,6 +43,10 @@ func (f *fakeKubeRay) GetCluster(_ context.Context, namespace, name string) (dom
 		return domain.ClusterDetail{}, &domain.NotFoundError{Kind: domain.KindRayCluster, Namespace: namespace, Name: name}
 	}
 	return c, nil
+}
+
+func (f *fakeKubeRay) Events(_ context.Context, _ domain.Kind, namespace, name string, _ int) ([]domain.Event, error) {
+	return f.events[clusterKey(namespace, name)], nil
 }
 
 // connectCluster wires a server (built from cfg + src + the kube fake) to an
@@ -81,7 +87,7 @@ func TestListToolsShowsClusterToolsWithReadOnlyHint(t *testing.T) {
 		byName[tool.Name] = tool
 	}
 
-	for _, name := range []string{"ray_cluster_list", "ray_cluster_get"} {
+	for _, name := range []string{"ray_cluster_list", "ray_cluster_get", "ray_cluster_events"} {
 		tool, ok := byName[name]
 		if !ok {
 			t.Fatalf("%s not registered; got tools %v", name, res.Tools)
@@ -257,6 +263,110 @@ func TestClusterGetNotFoundCleanError(t *testing.T) {
 	msg := textContent(res)
 	if !containsAll(msg, "ghost", "demo") {
 		t.Errorf("not-found message %q does not name the cluster + namespace", msg)
+	}
+}
+
+// TestClusterEventsStructuredAndText asserts ray_cluster_events returns bounded
+// structured rows (type/reason/message/count/age) plus a text summary that names
+// the count and warning count.
+func TestClusterEventsStructuredAndText(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	kube := &fakeKubeRay{events: map[string][]domain.Event{
+		clusterKey("demo", "alpha"): {
+			{Type: "Warning", Reason: "FailedScheduling", Message: "0/1 nodes: insufficient nvidia.com/gpu", Count: 3, LastSeen: time.Now()},
+			{Type: "Normal", Reason: "Scheduled", Message: "pod scheduled", Count: 1, LastSeen: time.Now().Add(-time.Minute)},
+		},
+	}}
+	session := connectCluster(t, cfg, kube)
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_cluster_events",
+		Arguments: map[string]any{"name": "alpha"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool reported error: %+v", res)
+	}
+
+	sc, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("StructuredContent is %T, want map[string]any", res.StructuredContent)
+	}
+	if got := sc["count"]; got != float64(2) {
+		t.Errorf("count = %v, want 2", got)
+	}
+	if got := sc["warnings"]; got != float64(1) {
+		t.Errorf("warnings = %v, want 1", got)
+	}
+	events, ok := sc["events"].([]any)
+	if !ok || len(events) != 2 {
+		t.Fatalf("events = %v, want two rows", sc["events"])
+	}
+	row, ok := events[0].(map[string]any)
+	if !ok {
+		t.Fatalf("row is %T, want map[string]any", events[0])
+	}
+	if row["reason"] != "FailedScheduling" || row["type"] != "Warning" {
+		t.Errorf("row = %v, want the FailedScheduling Warning", row)
+	}
+	if row["count"] != float64(3) {
+		t.Errorf("row count = %v, want 3", row["count"])
+	}
+
+	msg := textContent(res)
+	if !containsAll(msg, "alpha", "demo", "2", "1 warning") {
+		t.Errorf("text summary %q does not name count/namespace/warnings", msg)
+	}
+}
+
+// TestClusterEventsEmptyDoesNotReadHealthy asserts that with no events the text
+// summary explicitly says k8s expires events — an empty list must NOT read as a
+// clean bill of health.
+func TestClusterEventsEmptyDoesNotReadHealthy(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	session := connectCluster(t, cfg, &fakeKubeRay{})
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_cluster_events",
+		Arguments: map[string]any{"name": "quiet"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool reported error: %+v", res)
+	}
+
+	sc := res.StructuredContent.(map[string]any)
+	if got := sc["count"]; got != float64(0) {
+		t.Errorf("count = %v, want 0", got)
+	}
+	msg := textContent(res)
+	if !containsAll(msg, "no recent events", "quiet", "expires") {
+		t.Errorf("empty summary %q should warn that absence is not health", msg)
+	}
+}
+
+// TestClusterEventsMissingNameValidationError asserts an omitted name yields a
+// tool error (not a panic / not a successful empty result).
+func TestClusterEventsMissingNameValidationError(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	session := connectCluster(t, cfg, &fakeKubeRay{})
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_cluster_events",
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("CallTool transport error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("missing name did not produce a tool error: %+v", res)
 	}
 }
 
