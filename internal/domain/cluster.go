@@ -5,10 +5,13 @@ import "context"
 // ClusterReader is the narrow read slice of KubeRayPort the cluster read tools
 // need. ClusterService depends on this (not the full port) so callers wire only
 // what these tools use — the KubeRay adapter satisfies it with just its cluster
-// read methods implemented, and the full KubeRayPort satisfies it too.
+// read methods implemented, and the full KubeRayPort satisfies it too. It folds
+// in the event read so the three RayCluster read tools (list/get/events) share
+// one narrow dependency.
 type ClusterReader interface {
 	ListClusters(ctx context.Context, namespace string, opts ListOptions) (ClusterList, error)
 	GetCluster(ctx context.Context, namespace, name string) (ClusterDetail, error)
+	Events(ctx context.Context, kind Kind, namespace, name string, limit int) ([]Event, error)
 }
 
 // ClusterService is the thin orchestration layer over the KubeRay read path for
@@ -109,6 +112,52 @@ func (s *ClusterService) Get(ctx context.Context, req ClusterGetRequest) (Cluste
 	}
 
 	return ClusterGetResult{Detail: detail, Verbose: req.Verbose}, nil
+}
+
+// defaultEventLimit is the namespace-level default the service passes through
+// when the caller omits a limit. The adapter applies its own (smaller) default
+// when it still sees 0, so this is just the domain-side documented intent; the
+// service stays thin and lets the adapter own the firehose bounding policy.
+const defaultEventLimit = 25
+
+// ClusterEventsRequest is the decoded ray_cluster_events argument set. Name is
+// required (validated at the MCP edge); Namespace defaults to the service's
+// default; Limit caps the returned events (0 → defaultEventLimit).
+type ClusterEventsRequest struct {
+	Namespace string
+	Name      string
+	Limit     int
+}
+
+// ClusterEventsResult carries the bounded event slice plus the resolved scope so
+// the MCP layer can render an honest summary ("N events for X in NS"). An empty
+// Events slice is valid (and common — k8s expires events after ~1h); the MCP
+// layer must not read it as "healthy".
+type ClusterEventsResult struct {
+	Namespace string
+	Name      string
+	Events    []Event
+}
+
+// Events fetches recent, bounded k8s events for a RayCluster (operator events on
+// the object + scheduler/kubelet events on its pods, merged and bounded by the
+// adapter). The service owns only the cross-cutting policy: the default-namespace
+// fallback and the limit default; the adapter owns the gather/merge/Warning-first
+// bounding. A *NotFoundError-style error from the port propagates unchanged.
+func (s *ClusterService) Events(ctx context.Context, req ClusterEventsRequest) (ClusterEventsResult, error) {
+	namespace := s.resolveNamespace(req.Namespace)
+
+	limit := req.Limit
+	if limit <= 0 {
+		limit = defaultEventLimit
+	}
+
+	events, err := s.kube.Events(ctx, KindRayCluster, namespace, req.Name, limit)
+	if err != nil {
+		return ClusterEventsResult{}, err
+	}
+
+	return ClusterEventsResult{Namespace: namespace, Name: req.Name, Events: events}, nil
 }
 
 // resolveNamespace applies the default-namespace fallback. AllNamespaces is

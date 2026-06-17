@@ -37,6 +37,11 @@ type fakeKubeRay struct {
 	// passed through (to assert namespace defaulting / allNamespaces).
 	listClustersContinue string
 	lastListOpts         ListOptions
+
+	// lastEventsNamespace / lastEventsLimit capture the args the service passed
+	// to Events, so a test can assert the namespace default + limit default.
+	lastEventsNamespace string
+	lastEventsLimit     int
 }
 
 func key(namespace, name string) string { return namespace + "/" + name }
@@ -115,7 +120,9 @@ func (f *fakeKubeRay) Delete(_ context.Context, _ Kind, namespace, name string, 
 	return nil
 }
 
-func (f *fakeKubeRay) Events(_ context.Context, _ Kind, namespace, name string, _ int) ([]Event, error) {
+func (f *fakeKubeRay) Events(_ context.Context, _ Kind, namespace, name string, limit int) ([]Event, error) {
+	f.lastEventsNamespace = namespace
+	f.lastEventsLimit = limit
 	return f.events[key(namespace, name)], nil
 }
 

@@ -440,6 +440,178 @@ func TestClusterServiceEndToEnd(t *testing.T) {
 	}
 }
 
+// TestClusterEventsGathersAndFilters is the Task 7 end-to-end proof. envtest
+// runs no operator and no kubelet/scheduler, so NO events appear on their own —
+// the test CREATES core/v1 events itself to drive the adapter's gather/merge/
+// filter/sort/bound mapping. It proves, empirically:
+//   - newScheme() registers core/v1 (Pods + Events decode);
+//   - pod resolution by the ray.io/cluster=<name> label works;
+//   - events on BOTH the RayCluster object and its labeled pods are gathered;
+//   - an event on a pod NOT carrying the label is excluded;
+//   - the result is sorted Warnings-first then recent, with Count/LastSeen mapped.
+func TestClusterEventsGathersAndFilters(t *testing.T) {
+	adapter, k8s := startAdapter(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const (
+		namespace = "default"
+		name      = "events-cluster"
+	)
+
+	rc := newRayCluster(namespace, name)
+	if err := k8s.Create(ctx, rc); err != nil {
+		t.Fatalf("create RayCluster: %v", err)
+	}
+
+	// Two pods labeled for this cluster (head + worker) and one NOT labeled, to
+	// prove the label selector scopes the gather.
+	headPod := newPod(namespace, "events-cluster-head", map[string]string{"ray.io/cluster": name})
+	workerPod := newPod(namespace, "events-cluster-worker", map[string]string{"ray.io/cluster": name})
+	otherPod := newPod(namespace, "unrelated-pod", map[string]string{"ray.io/cluster": "some-other-cluster"})
+	for _, p := range []*corev1.Pod{headPod, workerPod, otherPod} {
+		if err := k8s.Create(ctx, p); err != nil {
+			t.Fatalf("create pod %q: %v", p.Name, err)
+		}
+	}
+
+	now := time.Now()
+	// Event on the RayCluster object itself (operator/reconcile event).
+	mustCreateEvent(ctx, t, k8s, fakeEvent(namespace, "ev-rc", "RayCluster", name,
+		corev1.EventTypeWarning, "FailedToCreateHeadPod", "head pod create failed", 1, now.Add(-30*time.Second)))
+	// Warning on a labeled pod (the "no GPU nodes" signal).
+	mustCreateEvent(ctx, t, k8s, fakeEvent(namespace, "ev-sched", "Pod", workerPod.Name,
+		corev1.EventTypeWarning, "FailedScheduling", "0/1 nodes: insufficient nvidia.com/gpu", 5, now.Add(-10*time.Second)))
+	// Normal on a labeled pod (most recent, but Normal — must sort after Warnings).
+	mustCreateEvent(ctx, t, k8s, fakeEvent(namespace, "ev-pulled", "Pod", headPod.Name,
+		corev1.EventTypeNormal, "Pulled", "image pulled", 1, now))
+	// Event on the UNLABELED pod — must be excluded.
+	mustCreateEvent(ctx, t, k8s, fakeEvent(namespace, "ev-other", "Pod", otherPod.Name,
+		corev1.EventTypeWarning, "FailedScheduling", "should not appear", 1, now))
+
+	events, err := adapter.Events(ctx, domain.KindRayCluster, namespace, name, 25)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+
+	if len(events) != 3 {
+		t.Fatalf("Events returned %d events, want 3 (cluster + 2 labeled-pod events, unlabeled excluded); got %+v", len(events), events)
+	}
+
+	byReason := map[string]domain.Event{}
+	for _, e := range events {
+		byReason[e.Reason+"/"+e.Message] = e
+	}
+	if _, ok := byReason["should not appear"]; ok {
+		t.Error("event on the UNLABELED pod was NOT excluded")
+	}
+
+	// The two Warnings must sort before the Normal regardless of recency (the
+	// Normal Pulled event is the most recent yet must come last).
+	if events[0].Type != corev1.EventTypeWarning || events[1].Type != corev1.EventTypeWarning {
+		t.Errorf("first two events = %q,%q, want both Warning (Warnings prioritized)", events[0].Type, events[1].Type)
+	}
+	if events[2].Type != corev1.EventTypeNormal || events[2].Reason != "Pulled" {
+		t.Errorf("last event = %q/%q, want the Normal Pulled event (Normals trimmed/sorted last)", events[2].Type, events[2].Reason)
+	}
+	// Among the Warnings, the more recent FailedScheduling must precede the older
+	// FailedToCreateHeadPod.
+	if events[0].Reason != "FailedScheduling" {
+		t.Errorf("events[0].Reason = %q, want FailedScheduling (most recent Warning first)", events[0].Reason)
+	}
+
+	// Count + LastSeen mapping: FailedScheduling carried count=5.
+	sched := events[0]
+	if sched.Count != 5 {
+		t.Errorf("FailedScheduling Count = %d, want 5", sched.Count)
+	}
+	if sched.LastSeen.IsZero() {
+		t.Error("FailedScheduling LastSeen is zero, want the mapped lastTimestamp")
+	}
+}
+
+// TestClusterEventsRespectsLimitAndWarningPriority proves the bounding keeps
+// Warnings when trimming: with more events than the limit, the kept set is the
+// Warnings (the actionable tier), Normals dropped first.
+func TestClusterEventsRespectsLimitAndWarningPriority(t *testing.T) {
+	adapter, k8s := startAdapter(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const (
+		namespace = "default"
+		name      = "bounded-cluster"
+	)
+
+	if err := k8s.Create(ctx, newRayCluster(namespace, name)); err != nil {
+		t.Fatalf("create RayCluster: %v", err)
+	}
+	pod := newPod(namespace, "bounded-pod", map[string]string{"ray.io/cluster": name})
+	if err := k8s.Create(ctx, pod); err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+
+	now := time.Now()
+	// One Warning + two more-recent Normals on the labeled pod.
+	mustCreateEvent(ctx, t, k8s, fakeEvent(namespace, "b-warn", "Pod", pod.Name,
+		corev1.EventTypeWarning, "BackOff", "back-off restarting", 2, now.Add(-time.Minute)))
+	mustCreateEvent(ctx, t, k8s, fakeEvent(namespace, "b-n1", "Pod", pod.Name,
+		corev1.EventTypeNormal, "Pulled", "pulled a", 1, now))
+	mustCreateEvent(ctx, t, k8s, fakeEvent(namespace, "b-n2", "Pod", pod.Name,
+		corev1.EventTypeNormal, "Created", "created b", 1, now.Add(-time.Second)))
+
+	events, err := adapter.Events(ctx, domain.KindRayCluster, namespace, name, 1)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("Events with limit=1 returned %d, want 1", len(events))
+	}
+	if events[0].Type != corev1.EventTypeWarning || events[0].Reason != "BackOff" {
+		t.Errorf("kept event = %q/%q, want the Warning BackOff (Warnings survive the trim over more-recent Normals)", events[0].Type, events[0].Reason)
+	}
+}
+
+// newPod builds a minimal pod for the event-resolution tests.
+func newPod(namespace, name string, labels map[string]string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: labels},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "main", Image: "rayproject/ray:2.9.0"}},
+		},
+	}
+}
+
+// fakeEvent builds a core/v1 Event referencing the given involvedObject. The
+// apiserver requires metadata.name on a namespaced event; lastTimestamp/count/
+// type drive the adapter's mapping.
+func fakeEvent(namespace, name, involvedKind, involvedName, eventType, reason, message string, count int32, last time.Time) *corev1.Event {
+	return &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:      involvedKind,
+			Namespace: namespace,
+			Name:      involvedName,
+		},
+		Type:           eventType,
+		Reason:         reason,
+		Message:        message,
+		Count:          count,
+		FirstTimestamp: metav1.NewTime(last),
+		LastTimestamp:  metav1.NewTime(last),
+	}
+}
+
+// mustCreateEvent creates an event or fails the test.
+func mustCreateEvent(ctx context.Context, t *testing.T, k8s client.Client, ev *corev1.Event) {
+	t.Helper()
+	if err := k8s.Create(ctx, ev); err != nil {
+		t.Fatalf("create event %q: %v", ev.Name, err)
+	}
+}
+
 // cond builds a metav1.Condition with the fields the mapping reads. LastTransitionTime
 // is required by the apiserver when writing conditions.
 func cond(condType string, status metav1.ConditionStatus, reason, message string) metav1.Condition {

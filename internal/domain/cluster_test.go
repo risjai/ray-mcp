@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 // newClusterFake seeds a fakeKubeRay with the given cluster details keyed by
@@ -215,5 +216,73 @@ func TestGetNotFoundPropagates(t *testing.T) {
 	}
 	if nf.Kind != KindRayCluster || nf.Name != "missing" || nf.Namespace != "default" {
 		t.Errorf("NotFoundError = %+v, want RayCluster missing in default", nf)
+	}
+}
+
+// TestEventsDefaultsNamespaceAndLimit asserts the service applies the
+// default-namespace fallback and the limit default when both are omitted, and
+// returns the seeded events for that resolved key.
+func TestEventsDefaultsNamespaceAndLimit(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeKubeRay{events: map[string][]Event{
+		key("ray-system", "demo"): {
+			{Type: "Warning", Reason: "FailedScheduling", LastSeen: time.Now()},
+		},
+	}}
+	svc := NewClusterService(fake, "ray-system")
+
+	res, err := svc.Events(context.Background(), ClusterEventsRequest{Name: "demo"})
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if fake.lastEventsNamespace != "ray-system" {
+		t.Errorf("namespace reaching the port = %q, want the default ray-system", fake.lastEventsNamespace)
+	}
+	if fake.lastEventsLimit != defaultEventLimit {
+		t.Errorf("limit reaching the port = %d, want the default %d", fake.lastEventsLimit, defaultEventLimit)
+	}
+	if res.Namespace != "ray-system" || res.Name != "demo" {
+		t.Errorf("result scope = %q/%q, want ray-system/demo", res.Namespace, res.Name)
+	}
+	if len(res.Events) != 1 || res.Events[0].Reason != "FailedScheduling" {
+		t.Errorf("Events = %+v, want the one seeded FailedScheduling event", res.Events)
+	}
+}
+
+// TestEventsExplicitNamespaceAndLimitPassThrough asserts a provided namespace +
+// limit reach the port unchanged (the adapter owns the firehose bounding).
+func TestEventsExplicitNamespaceAndLimitPassThrough(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeKubeRay{events: map[string][]Event{}}
+	svc := NewClusterService(fake, "default")
+
+	if _, err := svc.Events(context.Background(), ClusterEventsRequest{
+		Namespace: "team-a", Name: "demo", Limit: 5,
+	}); err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if fake.lastEventsNamespace != "team-a" {
+		t.Errorf("namespace = %q, want team-a passed through", fake.lastEventsNamespace)
+	}
+	if fake.lastEventsLimit != 5 {
+		t.Errorf("limit = %d, want 5 passed through", fake.lastEventsLimit)
+	}
+}
+
+// TestEventsEmptyIsNotAnError asserts an empty event slice is a valid result, not
+// an error — k8s expires events after ~1h, so absence is silence, not failure.
+func TestEventsEmptyIsNotAnError(t *testing.T) {
+	t.Parallel()
+
+	svc := NewClusterService(&fakeKubeRay{events: map[string][]Event{}}, "default")
+
+	res, err := svc.Events(context.Background(), ClusterEventsRequest{Name: "quiet"})
+	if err != nil {
+		t.Fatalf("Events on a cluster with no events errored: %v", err)
+	}
+	if len(res.Events) != 0 {
+		t.Errorf("Events = %+v, want empty", res.Events)
 	}
 }

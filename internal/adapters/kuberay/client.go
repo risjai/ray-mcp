@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -144,11 +145,17 @@ func newRuntimeClient(contextName, defaultNamespace string, k8s client.Client) *
 }
 
 // newScheme builds a runtime.Scheme with the KubeRay v1 types (RayCluster,
-// RayJob, RayService and their lists) registered. The uncached client decodes
-// typed CRD objects against this scheme.
+// RayJob, RayService and their lists) plus core/v1 registered. The uncached
+// client decodes typed CRD objects against the KubeRay types; core/v1 is needed
+// so ray_cluster_events can decode Pods (label-selected by ray.io/cluster) and
+// Events (corev1.EventList) — controller-runtime's client does NOT register core
+// types by default.
 func newScheme() (*runtime.Scheme, error) {
 	scheme := runtime.NewScheme()
 	if err := rayv1.AddToScheme(scheme); err != nil {
+		return nil, err //nolint:wrapcheck // trivial scheme-registration failure; the caller has full context.
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
 		return nil, err //nolint:wrapcheck // trivial scheme-registration failure; the caller has full context.
 	}
 	return scheme, nil

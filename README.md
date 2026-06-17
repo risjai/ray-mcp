@@ -1,10 +1,10 @@
 # ray-mcp
 MCP server for managing Ray Clusters and Jobs. Written in Go for native k8s support.
 
-> **Status:** early development. Today the server exposes three read-only tools over
-> the stdio transport — `ray_capabilities`, `ray_cluster_list`, and
-> `ray_cluster_get`. Write/destructive tiers and Ray job/service tools are being
-> added iteratively.
+> **Status:** early development. Today the server exposes four read-only tools over
+> the stdio transport — `ray_capabilities`, `ray_cluster_list`, `ray_cluster_get`,
+> and `ray_cluster_events`. Write/destructive tiers and Ray job/service tools are
+> being added iteratively.
 
 ## 🚀 Try it end-to-end
 
@@ -24,7 +24,9 @@ go build -o ray-mcp ./cmd/ray-mcp
 `ray_capabilities` reports the server version, bound kubeconfig context, default
 namespace, enabled tool tiers, and the CI-tested KubeRay version — no live cluster
 call. `ray_cluster_list` / `ray_cluster_get` read RayClusters from the bound cluster
-(dialed lazily on first use, so the server boots even with no cluster reachable).
+(dialed lazily on first use, so the server boots even with no cluster reachable);
+`ray_cluster_events` returns recent, bounded k8s events for a cluster and its pods
+(Warnings first — the "Pending: no GPU nodes" signal).
 Write tools register only with `--allow-mutations` (and `--allow-destructive`
 for the destructive tier). Under stdio, **stdout is the JSON-RPC wire**; all logs go
 to stderr.
