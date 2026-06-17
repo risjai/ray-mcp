@@ -14,11 +14,20 @@ install KubeRay, create a sample Ray cluster, build ray-mcp, and ask Claude Code
 about your cluster — no prior Ray knowledge needed. Needs Docker + kubectl + Go +
 Claude Code. ~20–30 min, fully disposable.
 
-## Quickstart (skeleton)
+## Quickstart
+
+Install the binary with Go (no clone needed):
+
+```sh
+go install github.com/risjai/ray-mcp/cmd/ray-mcp@latest   # or @v0.1.0 to pin
+ray-mcp --default-namespace <ns>       # speaks MCP JSON-RPC over stdio
+```
+
+Or build from a clone:
 
 ```sh
 go build -o ray-mcp ./cmd/ray-mcp
-./ray-mcp --default-namespace <ns>     # speaks MCP JSON-RPC over stdio
+./ray-mcp --default-namespace <ns>
 ```
 
 `ray_capabilities` reports the server version, bound kubeconfig context, default

@@ -11,20 +11,32 @@ how to verify the connection by hand.
 > transport arrives later. The install steps below won't change as tools are added —
 > you point your agent at the same binary.
 
-## 1. Build the binary
+## 1. Install the binary
+
+Fastest — install straight from the module with Go (no clone):
+
+```sh
+go install github.com/risjai/ray-mcp/cmd/ray-mcp@latest   # or @v0.1.0 to pin
+```
+
+This drops `ray-mcp` in `$(go env GOBIN)` (or `$(go env GOPATH)/bin`). Get its
+absolute path for the agent config below:
+
+```sh
+echo "$(go env GOBIN)/ray-mcp"      # if GOBIN is set
+echo "$(go env GOPATH)/bin/ray-mcp" # otherwise
+```
+
+Or build from a clone:
 
 ```sh
 git clone https://github.com/risjai/ray-mcp.git
 cd ray-mcp
 go build -o ray-mcp ./cmd/ray-mcp     # produces ./ray-mcp
+echo "$(pwd)/ray-mcp"                  # absolute path for the agent config
 ```
 
-Requires Go 1.26.3 (see `go.mod`). Note the **absolute path** to the binary —
-your agent config needs it:
-
-```sh
-echo "$(pwd)/ray-mcp"
-```
+Requires Go 1.26.3+ (see `go.mod`).
 
 ## 2. Flags you'll likely set
 

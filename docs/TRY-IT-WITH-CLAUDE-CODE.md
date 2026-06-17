@@ -62,6 +62,11 @@ path** — you'll need it for Claude Code:
 echo "$(pwd)/ray-mcp"
 ```
 
+> You can also install just the binary without cloning —
+> `go install github.com/risjai/ray-mcp/cmd/ray-mcp@latest` (or `@v0.1.0`) — but
+> this guide still clones, because step 4 uses the `examples/` manifest from the
+> repo.
+
 Keep that path handy (copy it somewhere).
 
 ---

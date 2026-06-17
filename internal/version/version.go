@@ -5,8 +5,10 @@ package version
 
 const (
 	// Version is the ray-mcp server version. It is a build-time constant; a
-	// release build may stamp it via -ldflags, but the dev default lives here.
-	Version = "0.0.0-dev"
+	// release build may stamp it via -ldflags, but the default lives here and is
+	// bumped at each tagged release. v0.1.0 is the read-only preview: the
+	// RayCluster read path (list/get/events) + ray_capabilities over stdio.
+	Version = "0.1.0"
 
 	// KubeRayTested is the KubeRay version range ray-mcp is compiled and
 	// CI-tested against. It is reported verbatim by ray_capabilities — Task 4
