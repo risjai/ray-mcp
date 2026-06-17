@@ -1,0 +1,23 @@
+# Binds the read-only floor (ClusterRole ray-mcp-readonly) to the ray-mcp
+# ServiceAccount, cluster-wide. This is the binding to use when ray-mcp runs with
+# `--allow-all-namespaces` (the default cluster-scoped read).
+#
+# For a SINGLE-NAMESPACE deployment, DO NOT use this ClusterRoleBinding. Bind the
+# same ClusterRole with a namespaced RoleBinding instead (see deploy/rbac/README.md)
+# — the RoleBinding confines the grant to its own namespace, so ray-mcp can only
+# read the namespace it lives in.
+#
+# The subject namespace must match the ServiceAccount's namespace
+# (serviceaccount.yaml); change both together if you relocate ray-mcp.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ray-mcp-readonly
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ray-mcp-readonly
+subjects:
+  - kind: ServiceAccount
+    name: ray-mcp
+    namespace: default

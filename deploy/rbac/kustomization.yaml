@@ -1,0 +1,14 @@
+# Bundles the read-only RBAC floor so it installs in one shot:
+#
+#   kubectl apply -k deploy/rbac/
+#
+# An installer relocating ray-mcp to a non-default namespace can set `namespace:`
+# here (it rewrites the ServiceAccount's namespace and the ClusterRoleBinding
+# subject namespace together — the ClusterRole stays cluster-scoped and unnamed by
+# namespace, which is correct).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - serviceaccount.yaml
+  - clusterrole.yaml
+  - clusterrolebinding.yaml

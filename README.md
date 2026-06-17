@@ -131,7 +131,8 @@ Needs Docker + kubectl + Go + Claude Code; ~20–30 min; fully disposable.
 | RayJob tools — submit / get / logs / wait / list / delete | 📋 Planned |
 | RayService tools — deploy / update / list / get / delete | 📋 Planned |
 | Streamable HTTP transport + auth (static bearer / TokenReview) | 📋 Planned |
-| Distribution — RBAC manifests + Helm chart | 📋 Planned |
+| Read-only RBAC floor — ServiceAccount + ClusterRole ([`deploy/rbac/`](deploy/rbac/)) | ✅ Shipped (read-only) |
+| Helm chart + in-cluster Deployment | 📋 Planned |
 | Prebuilt binaries + Homebrew (GoReleaser) | 📋 Planned |
 
 ✅ Shipped · 🚧 Next (Phase 2, in progress) · 📋 Planned
