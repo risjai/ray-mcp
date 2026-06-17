@@ -1,95 +1,132 @@
 # ray-mcp
-MCP server for managing Ray Clusters and Jobs. Written in Go for native k8s support.
 
-> **Status:** early development. Today the server exposes four read-only tools over
-> the stdio transport — `ray_capabilities`, `ray_cluster_list`, `ray_cluster_get`,
-> and `ray_cluster_events`. Write/destructive tiers and Ray job/service tools are
-> being added iteratively.
+**An MCP server for [Ray](https://www.ray.io/) on Kubernetes.** Point Claude (or
+any MCP client) at your cluster and ask about your Ray workloads in plain language.
+Read-only today; a guarded write path is on the way (see below).
 
-## 🚀 Try it end-to-end
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+![Go](https://img.shields.io/badge/go-1.26.3-00ADD8)
+![Status](https://img.shields.io/badge/status-v0.1.0%20preview-orange)
 
-New here and want to see it work? **[docs/TRY-IT-WITH-CLAUDE-CODE.md](docs/TRY-IT-WITH-CLAUDE-CODE.md)**
-is a zero-to-Claude-Code walkthrough: spin up a local Kubernetes cluster (kind),
-install KubeRay, create a sample Ray cluster, build ray-mcp, and ask Claude Code
-about your cluster — no prior Ray knowledge needed. Needs Docker + kubectl + Go +
-Claude Code. ~20–30 min, fully disposable.
+> **Status: v0.1.0 — read-only preview.** Today: `ray_capabilities` +
+> `ray_cluster_list` / `ray_cluster_get` / `ray_cluster_events`, over stdio.
+> Write/destructive tiers and Ray job/service tools are landing iteratively.
 
-## Quickstart
+## Why ray-mcp
 
-Install the binary with Go (no clone needed):
+A generic Kubernetes MCP can `kubectl get` a RayCluster CRD and hand the agent raw
+YAML. ray-mcp is built specifically for Ray, with the LLM as the consumer.
+
+**What it does today (v0.1.0):**
+
+- **Distilled status, not raw YAML.** `ray_cluster_get` returns a one-line health
+  read — `"Ready; 1/1 workers ready"`, derived from the cluster's conditions — not a
+  wall of `.status`. `ray_cluster_events` surfaces *why* a cluster is stuck,
+  Warnings first — e.g. a pod's `FailedScheduling` event with message *"0/1 nodes
+  available: insufficient nvidia.com/gpu"* — instead of leaving the agent to dig.
+- **Read-only and token-bounded by default.** Safe to point at any cluster — no
+  tool can mutate it. Output is compact and capped (small list rows, bounded event
+  slices), because the consumer is an LLM with a finite context budget.
+
+**On the roadmap (designed, not yet built):**
+
+- **The wedge** — a read-only reach into Ray's dashboard/job API for live job
+  status and logs, the runtime detail the CRDs don't hold (this is where the
+  distillation above extends to jobs: *"why is my job pending?"*).
+- **Guarded writes** — create / update / scale / delete via Server-Side Apply with
+  dry-run, before/after diffs, and tiered safety gates
+  (`--allow-mutations` → `--allow-destructive`). The unauthenticated Ray dashboard
+  is never a write vector — writes only ever go through the guarded CRD path.
+
+## Install
 
 ```sh
 go install github.com/risjai/ray-mcp/cmd/ray-mcp@latest   # or @v0.1.0 to pin
-ray-mcp --default-namespace <ns>       # speaks MCP JSON-RPC over stdio
 ```
 
-Or build from a clone:
+Requires **Go 1.26.3+**. This drops a `ray-mcp` binary in `$(go env GOPATH)/bin`
+(or `$(go env GOBIN)`). No Go? Build from a clone instead — see
+[docs/INSTALL.md](docs/INSTALL.md).
+
+## Connect it to your agent
+
+ray-mcp speaks MCP over stdio — your agent launches it as a subprocess. The binary
+is a server; you don't run it directly (it'll just wait on stdin). Register it:
+
+**Claude Code**
+```sh
+claude mcp add --scope user ray-mcp "$(go env GOPATH)/bin/ray-mcp" \
+  -- --context <your-kube-context> --default-namespace <ns>
+```
+
+**Claude Desktop** — add to `claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "ray-mcp": {
+      "command": "/absolute/path/to/ray-mcp",
+      "args": ["--context", "<your-kube-context>", "--default-namespace", "<ns>"]
+    }
+  }
+}
+```
+
+Cursor and other MCP clients use the same shape (command + args). Full details,
+flags, and a by-hand verification: [docs/INSTALL.md](docs/INSTALL.md).
+
+## What you can do today
+
+Four read-only tools (the three cluster tools carry `readOnlyHint`):
+
+| Tool | Ask your agent… |
+|------|-----------------|
+| `ray_cluster_list` | "list the Ray clusters in namespace `team-a`" |
+| `ray_cluster_get` | "is `ray-sample` healthy? how many workers are ready?" |
+| `ray_cluster_events` | "why is `ray-sample` stuck? show recent events" |
+| `ray_capabilities` | "what can this ray-mcp server do?" (needs no cluster) |
+
+A real `ray_cluster_list` result against a live cluster looks like:
+
+```json
+{
+  "clusters": [
+    {"name": "ray-sample", "namespace": "default", "phase": "Ready",
+     "ready": 1, "desired": 1, "ageSeconds": 122,
+     "health": "Ready; 1/1 workers ready"}
+  ],
+  "count": 1, "moreAvailable": false
+}
+```
+
+The server **boots even with no reachable cluster** — `ray_capabilities` always
+works; the cluster tools dial lazily on first use and return a clean error (then
+retry, no restart) if the kubeconfig can't reach a cluster.
+
+## Try it end-to-end (no Ray experience needed)
+
+Don't have a Ray cluster yet? **[docs/TRY-IT-WITH-CLAUDE-CODE.md](docs/TRY-IT-WITH-CLAUDE-CODE.md)**
+takes you from zero to asking Claude Code about a live cluster: spin up a local
+kind cluster, install KubeRay, create a sample Ray cluster, and connect ray-mcp.
+Needs Docker + kubectl + Go + Claude Code; ~20–30 min; fully disposable.
+
+## Learn more
+
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — layers, ports, data flows, and
+  diagrams (what's built vs. designed).
+- **[docs/INSTALL.md](docs/INSTALL.md)** — install + every agent client + flag reference.
+- **[docs/specs/ray-mcp-design.md](docs/specs/ray-mcp-design.md)** — the authoritative design.
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — the five-tier test pyramid, the
+  "adding a tool" checklist, and the project invariants. Read this before a PR.
+
+## Contributing & testing
+
+PRs welcome. The fast test loop needs no Docker:
 
 ```sh
-go build -o ray-mcp ./cmd/ray-mcp
-./ray-mcp --default-namespace <ns>
+make test          # unit + dashboard + MCP tiers — fast, no Docker
+make test-envtest  # KubeRay adapter against envtest (apiserver+etcd, no Docker)
+make e2e           # real kind + KubeRay cluster (needs Docker + kind)
 ```
 
-`ray_capabilities` reports the server version, bound kubeconfig context, default
-namespace, enabled tool tiers, and the CI-tested KubeRay version — no live cluster
-call. `ray_cluster_list` / `ray_cluster_get` read RayClusters from the bound cluster
-(dialed lazily on first use, so the server boots even with no cluster reachable);
-`ray_cluster_events` returns recent, bounded k8s events for a cluster and its pods
-(Warnings first — the "Pending: no GPU nodes" signal).
-Write tools register only with `--allow-mutations` (and `--allow-destructive`
-for the destructive tier). Under stdio, **stdout is the JSON-RPC wire**; all logs go
-to stderr.
-
-## Use it with an AI agent
-
-To connect ray-mcp to Claude Desktop, Claude Code, Cursor, or any MCP client — and
-to verify the connection by hand — see **[docs/INSTALL.md](docs/INSTALL.md)**.
-
-## Architecture
-
-For the layers, ports, data flows, and diagrams (what's built vs. designed), see
-**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**. The authoritative design spec is
-[docs/specs/ray-mcp-design.md](docs/specs/ray-mcp-design.md).
-
-## Testing
-
-A five-tier pyramid; the fast loop needs no Docker:
-
-```sh
-make test          # tiers 1/3/4 (unit, dashboard httptest, MCP) — fast, no Docker
-make test-envtest  # tier 2: KubeRay adapter against envtest (apiserver+etcd, no Docker)
-make e2e           # tier 5: real kind + KubeRay cluster (needs Docker + kind)
-make pre-push      # all runnable tiers, before pushing a cluster-touching change
-```
-
-### Run them end-to-end from a clone
-
-```sh
-git clone https://github.com/risjai/ray-mcp.git && cd ray-mcp
-
-make build         # compile everything
-make test          # fast tiers — no Docker, no downloads
-
-# Tier 2 (envtest): downloads the apiserver/etcd binaries + KubeRay CRDs on first
-# run (no Docker). Proves the KubeRay adapter's RayCluster List/Get + status mapping.
-make test-envtest
-
-# Tier 5 (e2e): needs Docker running + kind installed (`brew install kind`).
-# Stands up a real kind cluster + KubeRay operator, runs the e2e tests, tears down.
-make e2e
-```
-
-Expected: `make test` and `make test-envtest` are green with no Docker. `make e2e`
-is green once Docker + kind are present. Versions are pinned in
-`hack/kuberay-version.env`.
-
-**Before adding a new tool or raising a PR**, read **[CONTRIBUTING.md](CONTRIBUTING.md)**
-— it covers the test pyramid, which tier proves what, the "adding a tool" checklist,
-and the project invariants (hexagonal imports, the stdio/stdout rule, the read-only
-dashboard). The full rationale lives in
-[`docs/specs/ray-mcp-testing-strategy.md`](docs/specs/ray-mcp-testing-strategy.md).
-
-## Contributing
-
-See **[CONTRIBUTING.md](CONTRIBUTING.md)** for setup, the testing workflow, and PR
-guidelines.
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full workflow and what each tier
+proves. Licensed under [Apache 2.0](LICENSE).
