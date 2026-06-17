@@ -1,0 +1,71 @@
+# The read-only security floor for ray-mcp.
+#
+# ray-mcp v0.1.0 is read-only: it lists/gets KubeRay CRs and lists the pods +
+# events behind a RayCluster, and nothing else. This Role grants EXACTLY that and
+# refuses everything else, so the boundary is correct-by-default BEFORE the write
+# tools (Tasks 8–12) land — not retrofitted under pressure once a dangerous tool
+# already exists. Every rule below maps to a real API call ray-mcp makes today;
+# anything not listed (create/update/patch/delete, pods/exec, pods/portforward,
+# secrets, nodes, `*`) is deliberately NOT granted.
+#
+# Cluster-scoped (ClusterRole, not Role) because ray-mcp supports
+# `--allow-all-namespaces`: ray_cluster_list across all namespaces needs a
+# cluster-scoped read. An installer that wants to confine ray-mcp to ONE namespace
+# does NOT edit this file — they bind this same ClusterRole with a namespaced
+# RoleBinding instead of the ClusterRoleBinding (the RoleBinding scopes the grant
+# to its own namespace). See deploy/rbac/README.md for both bindings.
+#
+# This is read-only BY CONSTRUCTION: the only verbs anywhere below are
+# get/list/watch. There is no write verb to find. The deploy/rbac/rbac_test.go
+# unit guard fails the build if anyone ever adds one.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ray-mcp-readonly
+rules:
+  # KubeRay custom resources (group ray.io).
+  #
+  # rayclusters: required TODAY by ray_cluster_list (List) and ray_cluster_get
+  #   (Get). ray_cluster_events also Gets the cluster's name implicitly via its
+  #   pods, but the cluster read itself is covered here.
+  #
+  # rayjobs, rayservices: NOT called by any tool today. Included PROACTIVELY —
+  #   they are read-only resources and the read tools for them are on the roadmap
+  #   (ray_job_*/ray_service_* reads). Grouping the three read CRDs now means the
+  #   floor does not need editing when those land. This is a judgment call: it
+  #   grants slightly more than is exercised today, but only read verbs on
+  #   read-only KubeRay CRs, so the blast radius is nil. To keep it strictly to
+  #   what is called today, drop rayjobs/rayservices and leave rayclusters.
+  #
+  # verbs get/list/watch: the standard read triple. `watch` is granted for
+  #   future-proofing (it is the harmless completion of read and costs nothing for
+  #   a read-only floor) even though ray-mcp uses an UNCACHED client today and
+  #   watches nothing — see the core rule below, which is kept tighter precisely
+  #   because nothing watches pods/events.
+  - apiGroups: ["ray.io"]
+    resources: ["rayclusters", "rayjobs", "rayservices"]
+    verbs: ["get", "list", "watch"]
+
+  # Core resources (group "").
+  #
+  # pods + events: required TODAY by ray_cluster_events, which Lists the pods
+  #   carrying the ray.io/cluster=<name> label and Lists the namespace's events to
+  #   filter them to the cluster + its pods.
+  #
+  # verbs get/list ONLY — no watch. ray-mcp's event tool does a single capped List
+  #   per call against an uncached client; it never establishes an informer/watch
+  #   on pods or events, so granting watch here would be unused power. Kept tighter
+  #   than the CRD rule on purpose.
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list"]
+
+  # Deliberately NOT granted (documented so the omission is visible, not an
+  # oversight):
+  #   - create/update/patch/delete on anything — v0.1.0 has no write tools.
+  #   - pods/exec, pods/portforward — the wedge's port-forward is a FUTURE adapter
+  #     (Task 14). In-cluster it will use a direct dial to the head service, which
+  #     needs no portforward RBAC; if a future out-of-cluster mode needs
+  #     pods/portforward it will be added with that task, scoped and reviewed.
+  #   - secrets, nodes, configmaps — never read by any tool.
+  #   - `*` (wildcard) verbs or resources — the floor is an allowlist, never "all".
