@@ -118,6 +118,24 @@ Needs Docker + kubectl + Go + Claude Code; ~20–30 min; fully disposable.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — the five-tier test pyramid, the
   "adding a tool" checklist, and the project invariants. Read this before a PR.
 
+## Roadmap
+
+| Feature | Status |
+|---------|--------|
+| `ray_capabilities` — server info, bound context, tiers | ✅ Shipped (v0.1.0) |
+| RayCluster read — `list` / `get` (distilled status) | ✅ Shipped (v0.1.0) |
+| RayCluster events — `ray_cluster_events` (Warnings-first) | ✅ Shipped (v0.1.0) |
+| RayCluster writes — create / update / scale (SSA, dry-run, diffs) | 🚧 Next |
+| RayCluster delete — destructive tier + confirm-fingerprint | 🚧 Next |
+| The wedge — read-only Ray dashboard/job API reach (live status) | 📋 Planned |
+| RayJob tools — submit / get / logs / wait / list / delete | 📋 Planned |
+| RayService tools — deploy / update / list / get / delete | 📋 Planned |
+| Streamable HTTP transport + auth (static bearer / TokenReview) | 📋 Planned |
+| Distribution — RBAC manifests + Helm chart | 📋 Planned |
+| Prebuilt binaries + Homebrew (GoReleaser) | 📋 Planned |
+
+✅ Shipped · 🚧 Next (Phase 2, in progress) · 📋 Planned
+
 ## Contributing & testing
 
 PRs welcome. The fast test loop needs no Docker:
