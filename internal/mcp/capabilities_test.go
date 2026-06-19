@@ -8,6 +8,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/risjai/ray-mcp/internal/config"
+	"github.com/risjai/ray-mcp/internal/domain"
 	mcpserver "github.com/risjai/ray-mcp/internal/mcp"
 	"github.com/risjai/ray-mcp/internal/version"
 )
@@ -30,7 +31,7 @@ func connect(t *testing.T, cfg *config.Config, src fakeSource) *mcp.ClientSessio
 	t.Helper()
 	ctx := context.Background()
 
-	server := mcpserver.NewServer(cfg, src, &fakeKubeRay{})
+	server := mcpserver.NewServer(cfg, src, &fakeKubeRay{}, &fakeKubeRay{}, domain.NopAuditSink{})
 	serverT, clientT := mcp.NewInMemoryTransports()
 
 	if _, err := server.Connect(ctx, serverT, nil); err != nil {

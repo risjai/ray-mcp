@@ -17,13 +17,47 @@ type capabilitiesInput struct{}
 
 // CapabilitiesOutput is the structured result of ray_capabilities. It is the
 // StructuredContent of the CallToolResult; every field is config-derived, with
-// no live Kubernetes call (Task 4 scope).
+// no live Kubernetes call (Task 4 scope + the Task 9 static field-set report).
 type CapabilitiesOutput struct {
-	ServerVersion    string   `json:"serverVersion"    jsonschema:"the ray-mcp server version"`
-	KubeContext      string   `json:"kubeContext"      jsonschema:"the bound kubeconfig context name"`
-	DefaultNamespace string   `json:"defaultNamespace" jsonschema:"the namespace used when a tool omits one"`
-	EnabledTiers     []string `json:"enabledTiers"     jsonschema:"the enabled tool tiers (read, write, destructive)"`
-	KubeRayTested    string   `json:"kubeRayTested"    jsonschema:"the CI-tested KubeRay version range"`
+	ServerVersion    string          `json:"serverVersion"    jsonschema:"the ray-mcp server version"`
+	KubeContext      string          `json:"kubeContext"      jsonschema:"the bound kubeconfig context name"`
+	DefaultNamespace string          `json:"defaultNamespace" jsonschema:"the namespace used when a tool omits one"`
+	EnabledTiers     []string        `json:"enabledTiers"     jsonschema:"the enabled tool tiers (read, write, destructive)"`
+	KubeRayTested    string          `json:"kubeRayTested"    jsonschema:"the CI-tested KubeRay version range"`
+	FieldValidation  fieldValidation `json:"fieldValidation"  jsonschema:"how create/update inputs are validated, and the curated field set per CRD"`
+}
+
+// fieldValidation reports how the apply pipeline validates inputs and what the
+// curated field set is per CRD (the Task 4 deferral, re-homed here per Decision
+// Gate 1 / B2). B2 DEMOTED the boot-time CRD-schema-read: there is no live schema
+// introspection and no get-CRD RBAC grant. Instead, every apply runs an
+// unconditional server-side DryRunAll (Q5) — that is the validation/pruning oracle
+// — and this report lists the STATIC curated field set ray-mcp exposes per CRD.
+// An unknown field reaches the API server via rawSpec and is REJECTED there (a
+// structural-schema CRD rejects undeclared fields; it does not silently prune).
+type fieldValidation struct {
+	// Mode is always "server-side-dry-run": the validation oracle is the API
+	// server's DryRunAll on every apply, not a client-side schema read.
+	Mode string `json:"mode" jsonschema:"the validation strategy: server-side-dry-run (every apply is DryRunAll-validated)"`
+	// PruningDetection reports whether unknown fields are caught. Under SSA against
+	// a structural CRD they are REJECTED (hard error), so this is always true — but
+	// it is reported as rejection, never silent pruning.
+	PruningDetection bool `json:"pruningDetection" jsonschema:"true: unknown fields are rejected by the server-side dry-run (not silently pruned)"`
+	// CuratedFields lists the curated parameter names ray-mcp exposes per CRD kind.
+	// Anything outside this set is reachable only via the rawSpec escape hatch
+	// (when --allow-raw-spec is set) and validated server-side.
+	CuratedFields map[string][]string `json:"curatedFields" jsonschema:"the static curated parameter names exposed per CRD kind; richer fields go through rawSpec"`
+}
+
+// curatedClusterFields is the static curated field set for RayCluster create
+// (spec §6, Gate 1 C3 "curated params stay thin"). It is reported by
+// ray_capabilities so an agent can see, without trial and error, which knobs are
+// first-class vs which need the rawSpec escape hatch.
+var curatedClusterFields = []string{
+	"name", "namespace", "rayVersion", "image",
+	"headResources{cpu,memory,gpu}",
+	"workerGroups[]{name,replicas,minReplicas,maxReplicas,resources}",
+	"enableAutoscaling", "labels", "annotations", "rawSpec",
 }
 
 // enabledTiers derives the enabled tool tiers from config. It is pure (no I/O)
@@ -64,6 +98,11 @@ func addCapabilitiesTool(server *mcp.Server, cfg *config.Config, src capabilitie
 			DefaultNamespace: src.DefaultNamespace(),
 			EnabledTiers:     enabledTiers(cfg),
 			KubeRayTested:    version.KubeRayTested,
+			FieldValidation: fieldValidation{
+				Mode:             "server-side-dry-run",
+				PruningDetection: true,
+				CuratedFields:    map[string][]string{"RayCluster": curatedClusterFields},
+			},
 		}
 		// Set Content explicitly to a short summary; if left unset, the SDK
 		// would auto-fill Content with the JSON dump of the output, not a

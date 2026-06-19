@@ -21,6 +21,7 @@ import (
 	"github.com/risjai/ray-mcp/internal/adapters/kuberay"
 	"github.com/risjai/ray-mcp/internal/config"
 	mcpserver "github.com/risjai/ray-mcp/internal/mcp"
+	"github.com/risjai/ray-mcp/internal/observability"
 	"github.com/risjai/ray-mcp/internal/transport"
 )
 
@@ -50,7 +51,12 @@ func run() int {
 	// can be resolved; cluster tools return a clean error if the cluster is
 	// unreachable.
 	adapter := kuberay.NewClient(cfg)
-	server := mcpserver.NewServer(cfg, adapter, adapter)
+	// Audit sink for the mutation choke point (Task 8b): newline-delimited JSON to
+	// stderr, never stdout (the stdio JSON-RPC wire). Wired here even when mutations
+	// are disabled — NewServer only registers the audited write tools under
+	// --allow-mutations, so an unmutated server simply never emits a record.
+	audit := observability.NewAuditLogger(os.Stderr)
+	server := mcpserver.NewServer(cfg, adapter, adapter, adapter, audit)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

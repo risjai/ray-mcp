@@ -11,6 +11,7 @@ import (
 
 	"github.com/risjai/ray-mcp/internal/config"
 	mcpserver "github.com/risjai/ray-mcp/internal/mcp"
+	"github.com/risjai/ray-mcp/internal/observability"
 )
 
 // TestStdoutStaysClean asserts the stdio invariant: under stdio transport,
@@ -43,7 +44,9 @@ func TestStdoutStaysClean(t *testing.T) {
 	// Logger wired exactly as main.go wires it: to stderr, never stdout.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	server := mcpserver.NewServer(cfg, stdoutFakeSource{}, &fakeKubeRay{})
+	// Audit bound to io.Discard: the stdio invariant is that audit goes anywhere
+	// EXCEPT stdout; this proves the server emits nothing to stdout regardless.
+	server := mcpserver.NewServer(cfg, stdoutFakeSource{}, &fakeKubeRay{}, &fakeKubeRay{}, observability.NewAuditLogger(io.Discard))
 	serverT, clientT := mcp.NewInMemoryTransports()
 	if _, err := server.Connect(ctx, serverT, nil); err != nil {
 		t.Fatalf("server.Connect: %v", err)

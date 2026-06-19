@@ -2,6 +2,7 @@ package mcp_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -49,13 +50,28 @@ func (f *fakeKubeRay) Events(_ context.Context, _ domain.Kind, namespace, name s
 	return f.events[clusterKey(namespace, name)], nil
 }
 
+// BuildClusterBase and Apply let the read fake also satisfy the write backend
+// NewServer takes. The read-path tests run with AllowMutations=false, so the
+// write tools are never registered and these stubs are never called; they exist
+// only so connectCluster can pass one fake for both slices. The write path has its
+// own backend fake (fakeWriteBackend, cluster_write_test.go).
+func (f *fakeKubeRay) BuildClusterBase(_ domain.ClusterCreateParams) (domain.MergedSpec, error) {
+	return nil, errors.New("fakeKubeRay.BuildClusterBase not used in read-path tests")
+}
+
+func (f *fakeKubeRay) Apply(_ context.Context, _ domain.Kind, _, _ string, _ domain.MergedSpec, _ bool) (domain.MergedSpec, error) {
+	return nil, errors.New("fakeKubeRay.Apply not used in read-path tests")
+}
+
 // connectCluster wires a server (built from cfg + src + the kube fake) to an
 // in-memory client session.
 func connectCluster(t *testing.T, cfg *config.Config, kube domain.ClusterReader) *mcp.ClientSession {
 	t.Helper()
 	ctx := context.Background()
 
-	server := mcpserver.NewServer(cfg, fakeSource{contextName: "ctx", defaultNamespace: cfg.DefaultNamespace}, kube)
+	// Read-path tests run with mutations off, so the write backend is never
+	// invoked; a bare fake + nop audit satisfy NewServer's signature.
+	server := mcpserver.NewServer(cfg, fakeSource{contextName: "ctx", defaultNamespace: cfg.DefaultNamespace}, kube, &fakeKubeRay{}, domain.NopAuditSink{})
 	serverT, clientT := mcp.NewInMemoryTransports()
 
 	if _, err := server.Connect(ctx, serverT, nil); err != nil {
