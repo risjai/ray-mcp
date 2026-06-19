@@ -2,6 +2,7 @@ package mcp_test
 
 import (
 	"context"
+	"io"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -9,6 +10,7 @@ import (
 	"github.com/risjai/ray-mcp/internal/adapters/kuberay"
 	"github.com/risjai/ray-mcp/internal/config"
 	mcpserver "github.com/risjai/ray-mcp/internal/mcp"
+	"github.com/risjai/ray-mcp/internal/observability"
 )
 
 // TestCapabilitiesWorksOffline is the integration proof of the lazy-dial server-
@@ -27,7 +29,7 @@ func TestCapabilitiesWorksOffline(t *testing.T) {
 	}
 	adapter := kuberay.NewClient(cfg)
 
-	server := mcpserver.NewServer(cfg, adapter, adapter)
+	server := mcpserver.NewServer(cfg, adapter, adapter, adapter, observability.NewAuditLogger(io.Discard))
 	serverT, clientT := mcp.NewInMemoryTransports()
 	if _, err := server.Connect(ctx, serverT, nil); err != nil {
 		t.Fatalf("server.Connect: %v", err)
