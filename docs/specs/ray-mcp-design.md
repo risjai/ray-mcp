@@ -242,7 +242,7 @@ default namespace. Tools marked ★ depend on the wedge (dashboard API + tunnel)
 | `ray_cluster_events` | read | Recent k8s events for the cluster's pods |
 | `ray_cluster_create` | write | Create via the unified apply pipeline (§7.C), `dryRun` |
 | `ray_cluster_update` | write | Patch image/resources/replicas/autoscaling via SSA, `dryRun`, diff |
-| `ray_cluster_scale` | write | Scale a worker group min/max/replicas via SSA, `dryRun`, diff. **Scale-to-zero is destructive** (confirm-fingerprint) |
+| `ray_cluster_scale` | write → destructive on scale-to-zero | Scale a worker group min/max/replicas via SSA, `dryRun`, diff. **Scale-to-zero is destructive: requires `--allow-destructive` (tier) + confirm-fingerprint** (B3, resolved 2026-06-19). A non-zero scale is a plain write. |
 | `ray_cluster_delete` | destructive | Delete (honors `protected`); **confirm-fingerprint** (Q9), `dryRun` |
 
 ### RayJob
