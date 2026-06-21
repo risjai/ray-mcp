@@ -29,6 +29,7 @@ type applyRecord struct {
 	namespace string
 	name      string
 	dryRun    bool
+	force     bool
 }
 
 func (f *fakeWriteBackend) BuildClusterBase(p domain.ClusterCreateParams) (domain.MergedSpec, error) {
@@ -44,8 +45,8 @@ func (f *fakeWriteBackend) BuildClusterBase(p domain.ClusterCreateParams) (domai
 	}, nil
 }
 
-func (f *fakeWriteBackend) Apply(_ context.Context, kind domain.Kind, namespace, name string, spec domain.MergedSpec, dryRun bool) (domain.MergedSpec, error) {
-	f.applyCalls = append(f.applyCalls, applyRecord{kind: kind, namespace: namespace, name: name, dryRun: dryRun})
+func (f *fakeWriteBackend) Apply(_ context.Context, kind domain.Kind, namespace, name string, spec domain.MergedSpec, opts domain.ApplyOptions) (domain.MergedSpec, error) {
+	f.applyCalls = append(f.applyCalls, applyRecord{kind: kind, namespace: namespace, name: name, dryRun: opts.DryRun, force: opts.Force})
 	if f.applyErr != nil {
 		return nil, f.applyErr
 	}

@@ -83,15 +83,17 @@ type ClusterBaseBuilder interface {
 // the ClusterBaseBuilder port, the pure Merge, and the ApplyService.
 type ClusterWriteService struct {
 	base             ClusterBaseBuilder
+	get              ClusterGetter
 	apply            *ApplyService
 	defaultNamespace string
 }
 
-// NewClusterWriteService builds the service over the base builder, the apply
-// pipeline (Task 8b), and the default namespace (injected as a plain string so the
-// domain stays config/k8s-free).
-func NewClusterWriteService(base ClusterBaseBuilder, apply *ApplyService, defaultNamespace string) *ClusterWriteService {
-	return &ClusterWriteService{base: base, apply: apply, defaultNamespace: defaultNamespace}
+// NewClusterWriteService builds the service over the base builder (create), the
+// live-object reader (update/scale read-modify-apply-full), the apply pipeline
+// (Task 8b), and the default namespace (injected as a plain string so the domain
+// stays config/k8s-free).
+func NewClusterWriteService(base ClusterBaseBuilder, get ClusterGetter, apply *ApplyService, defaultNamespace string) *ClusterWriteService {
+	return &ClusterWriteService{base: base, get: get, apply: apply, defaultNamespace: defaultNamespace}
 }
 
 // Create runs the create half of the unified apply pipeline for one RayCluster:

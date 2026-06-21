@@ -74,12 +74,15 @@ type ClusterCreateOutput struct {
 	Diff       []fieldChangeOutput `json:"diff"        jsonschema:"the field-level diff of the submitted intent vs the server's view (server defaults surface here)"`
 }
 
-// addClusterWriteTools registers the mutating RayCluster tools against the domain
-// ClusterWriteService. It is called by NewServer ONLY when --allow-mutations is
-// set, so an unmutated server never advertises these (spec §6). allowRawSpec gates
-// whether the rawSpec arg appears in the advertised schema: when false the
-// power-user escape hatch is removed entirely (Gate 1 C3 hard mode).
-func addClusterWriteTools(server *mcp.Server, svc *domain.ClusterWriteService, allowRawSpec bool) {
+// addClusterWriteTools registers the mutating RayCluster tools (create, update,
+// scale) against the domain ClusterWriteService. It is called by NewServer ONLY
+// when --allow-mutations is set, so an unmutated server never advertises these
+// (spec §6). allowRawSpec gates whether the rawSpec arg appears in the advertised
+// schema: when false the power-user escape hatch is removed entirely (Gate 1 C3
+// hard mode). allowDestructive flows to ray_cluster_scale's scale-to-zero gate
+// (B3): scale-to-zero is registered under the write tier but refused at runtime
+// unless the destructive tier is enabled.
+func addClusterWriteTools(server *mcp.Server, svc *domain.ClusterWriteService, allowRawSpec, allowDestructive bool) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "ray_cluster_create",
 		Description: "Create a RayCluster from curated params (rayVersion, image, head/worker resources, worker groups, autoscaling) with an optional rawSpec escape hatch merged over them. Always server-side validated first; pass dryRun=true to validate without creating. Returns the field-level diff of your intent vs the server's view (server defaults surface here). Requires --allow-mutations.",
@@ -109,6 +112,9 @@ func addClusterWriteTools(server *mcp.Server, svc *domain.ClusterWriteService, a
 			Content: []mcp.Content{&mcp.TextContent{Text: clusterCreateSummary(out)}},
 		}, out, nil
 	})
+
+	addClusterUpdateTool(server, svc, allowRawSpec)
+	addClusterScaleTool(server, svc, allowDestructive)
 }
 
 // clusterCreateInputSchema returns the advertised input schema for

@@ -96,7 +96,7 @@ func TestApplyDryRunPersistsNothing(t *testing.T) {
 	const namespace, name = "default", "dryrun-cluster"
 	spec := clusterMergedSpec(namespace, name, nil)
 
-	out, err := adapter.Apply(ctx, domain.KindRayCluster, namespace, name, spec, true)
+	out, err := adapter.Apply(ctx, domain.KindRayCluster, namespace, name, spec, domain.ApplyOptions{DryRun: true})
 	if err != nil {
 		t.Fatalf("Apply(dryRun): %v", err)
 	}
@@ -122,7 +122,7 @@ func TestApplyCreatesAndReadsBack(t *testing.T) {
 	const namespace, name = "default", "applied-cluster"
 	spec := clusterMergedSpec(namespace, name, nil)
 
-	out, err := adapter.Apply(ctx, domain.KindRayCluster, namespace, name, spec, false)
+	out, err := adapter.Apply(ctx, domain.KindRayCluster, namespace, name, spec, domain.ApplyOptions{})
 	if err != nil {
 		t.Fatalf("Apply(commit): %v", err)
 	}
@@ -158,10 +158,10 @@ func TestApplyIsIdempotentUnderFieldManager(t *testing.T) {
 	const namespace, name = "default", "idempotent-cluster"
 	spec := clusterMergedSpec(namespace, name, nil)
 
-	if _, err := adapter.Apply(ctx, domain.KindRayCluster, namespace, name, spec, false); err != nil {
+	if _, err := adapter.Apply(ctx, domain.KindRayCluster, namespace, name, spec, domain.ApplyOptions{}); err != nil {
 		t.Fatalf("first Apply: %v", err)
 	}
-	if _, err := adapter.Apply(ctx, domain.KindRayCluster, namespace, name, spec, false); err != nil {
+	if _, err := adapter.Apply(ctx, domain.KindRayCluster, namespace, name, spec, domain.ApplyOptions{}); err != nil {
 		t.Fatalf("second Apply (same manager, same fields) should be a clean no-op, got: %v", err)
 	}
 }
@@ -182,7 +182,7 @@ func TestApplyDryRunRejectsUnknownField(t *testing.T) {
 		"thisFieldDoesNotExistInTheCRD": "rejected-by-ssa",
 	})
 
-	_, err := adapter.Apply(ctx, domain.KindRayCluster, namespace, name, spec, true)
+	_, err := adapter.Apply(ctx, domain.KindRayCluster, namespace, name, spec, domain.ApplyOptions{DryRun: true})
 	if err == nil {
 		t.Fatal("Apply(dryRun) with an unknown field returned nil error; SSA must reject it")
 	}
@@ -206,7 +206,7 @@ func TestApplyDoesNotMutateCallerSpec(t *testing.T) {
 	spec := clusterMergedSpec(namespace, name, nil)
 	snapshot := runtime.DeepCopyJSON(spec)
 
-	if _, err := adapter.Apply(ctx, domain.KindRayCluster, namespace, name, spec, false); err != nil {
+	if _, err := adapter.Apply(ctx, domain.KindRayCluster, namespace, name, spec, domain.ApplyOptions{}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 

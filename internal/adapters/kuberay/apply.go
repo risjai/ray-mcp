@@ -14,10 +14,11 @@ import (
 // fieldManager is the Server-Side Apply field manager ray-mcp owns. Every
 // mutation is attributed to it in the object's managedFields, which is how SSA
 // keeps ray-mcp's writes from clobbering fields another manager owns — notably
-// the Ray autoscaler's ownership of worker `replicas` (spec §7.D). We do NOT
-// pass client.ForceOwnership, so a genuine co-ownership conflict surfaces as a
-// domain.ConflictError for the update/scale tool (Task 10) to handle, rather
-// than being silently force-stolen.
+// the Ray autoscaler's ownership of worker `replicas` (spec §7.D). By default we
+// do NOT pass client.ForceOwnership, so a genuine co-ownership conflict surfaces
+// as a domain.ConflictError; update/scale opt into force only on a conflict-retry
+// (opts.Force, Task 10), having re-read the live object so the forced apply
+// re-asserts the contended value rather than clobbering it.
 const fieldManager = "ray-mcp"
 
 // Apply is the unified Server-Side Apply write path for create/update/scale/
@@ -43,7 +44,7 @@ const fieldManager = "ray-mcp"
 // set authoritatively from the typed args so the apply always targets exactly
 // kind/namespace/name (SSA requires all four) — Merge already identity-guards
 // the map, so this is a backstop, not a divergence.
-func (c *Client) Apply(ctx context.Context, kind domain.Kind, namespace, name string, spec domain.MergedSpec, dryRun bool) (domain.MergedSpec, error) {
+func (c *Client) Apply(ctx context.Context, kind domain.Kind, namespace, name string, spec domain.MergedSpec, applyOpts domain.ApplyOptions) (domain.MergedSpec, error) {
 	k8s, err := c.ensureClient()
 	if err != nil {
 		return nil, err
@@ -56,9 +57,15 @@ func (c *Client) Apply(ctx context.Context, kind domain.Kind, namespace, name st
 
 	opts := []client.ApplyOption{client.FieldOwner(fieldManager)}
 	verb := "apply"
-	if dryRun {
+	if applyOpts.DryRun {
 		opts = append(opts, client.DryRunAll)
 		verb = "dry-run apply"
+	}
+	if applyOpts.Force {
+		// ForceOwnership: take over fields another manager owns. update/scale set
+		// this only on a conflict-retry, after re-reading the live object so the
+		// contended value (e.g. autoscaler replicas) is re-asserted, not clobbered.
+		opts = append(opts, client.ForceOwnership)
 	}
 
 	if err := k8s.Apply(ctx, client.ApplyConfigurationFromUnstructured(obj), opts...); err != nil {

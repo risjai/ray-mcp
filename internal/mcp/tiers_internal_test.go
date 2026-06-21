@@ -8,8 +8,10 @@ import (
 )
 
 // TestEnabledTiers exercises the pure tier-derivation directly (white-box): read
-// is always on, write tracks --allow-mutations, destructive tracks
-// --allow-destructive.
+// is always on, write tracks --allow-mutations, and destructive ADDITIONALLY
+// requires --allow-mutations (spec §6: "destructive tools additionally require
+// --allow-destructive"). --allow-destructive without --allow-mutations is inert:
+// there is no write tier for it to extend, so destructive is not reported.
 func TestEnabledTiers(t *testing.T) {
 	t.Parallel()
 
@@ -20,7 +22,7 @@ func TestEnabledTiers(t *testing.T) {
 	}{
 		{"read only", &config.Config{}, []string{"read"}},
 		{"write only", &config.Config{AllowMutations: true}, []string{"read", "write"}},
-		{"destructive only", &config.Config{AllowDestructive: true}, []string{"read", "destructive"}},
+		{"destructive without mutations is inert", &config.Config{AllowDestructive: true}, []string{"read"}},
 		{"all", &config.Config{AllowMutations: true, AllowDestructive: true}, []string{"read", "write", "destructive"}},
 	}
 
