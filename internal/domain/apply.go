@@ -15,18 +15,30 @@ import "context"
 // interfaces the adapters satisfy, and the spec crosses the boundary as the
 // unstructured MergedSpec from Task 8a.
 
+// ApplyOptions controls one Server-Side Apply (Task 8b + Task 10).
+type ApplyOptions struct {
+	// DryRun maps to DryRunAll: the API server validates against the installed CRD
+	// schema (rejecting unknown fields and invalid values) but persists nothing.
+	DryRun bool
+	// Force takes ownership of fields another manager owns (SSA ForceOwnership). It
+	// is the update/scale conflict-retry knob: ray-mcp re-applies once with force
+	// after a genuine field-ownership conflict, having re-read the live object so it
+	// re-asserts (never clobbers) the contended value — notably the autoscaler's
+	// worker replicas on the atomic workerGroupSpecs list (Task 10). create never
+	// forces.
+	Force bool
+}
+
 // Applier is the narrow write slice of KubeRayPort the apply pipeline needs: a
-// single Server-Side Apply parameterized by Kind that maps to DryRunAll when
-// dryRun is true. ApplyService depends on this (not the full port) so it is
-// unit-testable with a fake that records what it was asked to apply. The KubeRay
-// adapter satisfies it; the full KubeRayPort satisfies it too.
+// single Server-Side Apply parameterized by Kind, with DryRun/Force options.
+// ApplyService depends on this (not the full port) so it is unit-testable with a
+// fake that records what it was asked to apply. The KubeRay adapter satisfies it;
+// the full KubeRayPort satisfies it too.
 type Applier interface {
 	// Apply server-side-applies the merged unstructured spec for kind/namespace/
 	// name with the ray-mcp field manager and returns the server's view of the
-	// object (the read-back). When dryRun is true it maps to DryRunAll: the API
-	// server validates against the installed CRD schema (rejecting unknown fields
-	// and invalid values) but persists nothing.
-	Apply(ctx context.Context, kind Kind, namespace, name string, spec MergedSpec, dryRun bool) (MergedSpec, error)
+	// object (the read-back). opts controls DryRunAll and ForceOwnership.
+	Apply(ctx context.Context, kind Kind, namespace, name string, spec MergedSpec, opts ApplyOptions) (MergedSpec, error)
 }
 
 // ApplyRequest is one mutation through the pipeline: the already-merged
@@ -41,6 +53,10 @@ type ApplyRequest struct {
 	Name      string
 	Spec      MergedSpec // the merged intent (curated base + rawSpec), from Merge.
 	DryRun    bool
+	// Force maps to SSA ForceOwnership on the commit apply. create leaves it false;
+	// update/scale set it on the conflict-retry apply only (Task 10). The DryRunAll
+	// preview is never forced — force changes ownership, not validation.
+	Force bool
 
 	// Tool and ArgsSummary feed the audit record (spec §8, Q8). ArgsSummary is a
 	// short, already-bounded description of the call — never the full spec.
@@ -108,8 +124,11 @@ func NewApplyService(kube Applier, audit AuditSink) *ApplyService {
 func (s *ApplyService) Apply(ctx context.Context, req ApplyRequest) (ApplyResult, error) {
 	// Step 1: unconditional DryRunAll. Validates against the installed CRD schema
 	// (rejecting unknown fields and invalid values) without persisting — on a
-	// committing apply just as on a preview.
-	dryRunObj, err := s.kube.Apply(ctx, req.Kind, req.Namespace, req.Name, req.Spec, true)
+	// committing apply just as on a preview. The preview inherits req.Force: SSA
+	// dry-run also performs field-ownership conflict detection, so a forced commit
+	// (the update/scale conflict-retry) must be previewed WITH force, or the dry-run
+	// would re-conflict before the commit it is meant to validate.
+	dryRunObj, err := s.kube.Apply(ctx, req.Kind, req.Namespace, req.Name, req.Spec, ApplyOptions{DryRun: true, Force: req.Force})
 	if err != nil {
 		s.emit(ctx, req, true, auditFailure(err))
 		return ApplyResult{}, err
@@ -125,7 +144,7 @@ func (s *ApplyService) Apply(ctx context.Context, req ApplyRequest) (ApplyResult
 	}
 
 	// Step 7: commit via SSA, then diff the server read-back against intent.
-	applied, err := s.kube.Apply(ctx, req.Kind, req.Namespace, req.Name, req.Spec, false)
+	applied, err := s.kube.Apply(ctx, req.Kind, req.Namespace, req.Name, req.Spec, ApplyOptions{Force: req.Force})
 	if err != nil {
 		s.emit(ctx, req, false, auditFailure(err))
 		return ApplyResult{}, err

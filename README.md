@@ -33,7 +33,8 @@ YAML. ray-mcp is built specifically for Ray, with the LLM as the consumer.
 - **The wedge** — a read-only reach into Ray's dashboard/job API for live job
   status and logs, the runtime detail the CRDs don't hold (this is where the
   distillation above extends to jobs: *"why is my job pending?"*).
-- **Guarded writes** — create / update / scale / delete via Server-Side Apply with
+- **Guarded writes** — `delete` (destructive tier + confirm-fingerprint) rounds out
+  the create / update / scale write path already shipped via Server-Side Apply with
   dry-run, before/after diffs, and tiered safety gates
   (`--allow-mutations` → `--allow-destructive`). The unauthenticated Ray dashboard
   is never a write vector — writes only ever go through the guarded CRD path.
@@ -126,7 +127,7 @@ Needs Docker + kubectl + Go + Claude Code; ~20–30 min; fully disposable.
 | RayCluster read — `list` / `get` (distilled status) | ✅ Shipped (v0.1.0) |
 | RayCluster events — `ray_cluster_events` (Warnings-first) | ✅ Shipped (v0.1.0) |
 | RayCluster create — `ray_cluster_create` (unified apply pipeline, SSA, dry-run, diffs) | ✅ Shipped (`--allow-mutations`) |
-| RayCluster writes — update / scale (SSA, dry-run, diffs) | 🚧 Next |
+| RayCluster writes — update / scale (SSA, dry-run, diffs, autoscaler-safe) | ✅ Shipped (`--allow-mutations`) |
 | RayCluster delete — destructive tier + confirm-fingerprint | 🚧 Next |
 | The wedge — read-only Ray dashboard/job API reach (live status) | 📋 Planned |
 | RayJob tools — submit / get / logs / wait / list / delete | 📋 Planned |

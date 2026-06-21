@@ -467,14 +467,36 @@ those autoscaler writes (classic Kubernetes lost update; worst-case on an
 autoscaling cluster). [verified: KubeRay autoscaling docs]
 
 1. Mutation gate → resolve target by name.
-2. Apply via the §7.C pipeline using **Server-Side Apply with our own field
-   manager**, sending **only the fields we intend to own**. SSA field-ownership
-   means we do not take over autoscaler-owned fields: `scale` applies the named
-   worker group's `replicas`/`minReplicas`/`maxReplicas`; on an autoscaling
-   cluster we surface a warning and do not force-apply `replicas` it doesn't own.
-3. On `Conflict` (a field genuinely co-owned): surface a clear conflict error;
-   retry once only when the change is ours to make.
+2. **Read-modify-apply-FULL** via the §7.C pipeline using Server-Side Apply with
+   our own field manager. **Correction (Task 10, envtest-verified against KubeRay
+   v1.6.1):** `spec.workerGroupSpecs` is an **atomic** SSA list (the CRD declares
+   no `x-kubernetes-list-type`), so a partial apply is impossible — the apply must
+   resend each worker group whole, and a same-manager partial apply would PRUNE the
+   rest of the spec. We therefore read the live object, overlay only the requested
+   change, and re-apply the full object — re-asserting (never stripping) the live
+   `replicas` the autoscaler last wrote. `update` never alters `replicas`; `scale`
+   changes it only when explicitly set, and **refuses `replicas` on an autoscaling
+   cluster** (set `min`/`max` instead — the autoscaler owns the live count).
+   `min`/`max` are ray-mcp-owned bounds and always safe to set.
+3. On `Conflict`: because the atomic list means even the autoscaler's JSON-Patch
+   write contends, a contended apply conflicts. We **retry once with force from a
+   fresh read** — the fresh read re-asserts the autoscaler's current `replicas`, so
+   the forced apply takes list ownership while preserving the value read just before
+   it ("retry once only when the change is ours"). This is **best-effort, not
+   race-free**: an autoscaler write that interleaves the retry's read→apply gap can
+   still be lost (acceptable — the autoscaler re-corrects on its next reconcile, and
+   `replicas` is its field to drive). A user-requested `dryRun` is never forced.
 4. Return a **field-level diff** (see §10 output contract), not the whole object.
+
+> *Original §7.D assumed granular per-field SSA ownership of `replicas` (so omitting
+> it would avoid contention). envtest disproved that for v1.6.1's atomic
+> `workerGroupSpecs`; the read-modify-apply-full + force-on-retry approach above is
+> the verified replacement.* `ray_cluster_scale` also runs **client-side
+> `min<=max` and `replicas<=max` guards**: v1.6.1's RayCluster validating webhook is
+> `ENABLE_WEBHOOKS`-gated and **off by default**, so on a standard install
+> `DryRunAll` does not reach it and won't reject an inverted bound (the rule
+> otherwise lives only in the operator reconcile); the guards cover the default case
+> and are harmlessly redundant when the webhook is enabled.
 
 ## 8. Safety Model
 

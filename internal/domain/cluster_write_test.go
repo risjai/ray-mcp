@@ -37,7 +37,9 @@ func baseFor(namespace, name string) MergedSpec {
 // with a recording audit sink, returning all three for assertions.
 func newWriteService(base ClusterBaseBuilder, applier Applier, defaultNS string) (*ClusterWriteService, *recordingSink) {
 	sink := &recordingSink{}
-	svc := NewClusterWriteService(base, NewApplyService(applier, sink), defaultNS)
+	// Create does not read the live object, so a zero-value reader is unused here;
+	// update/scale wire a real ClusterGetter (see cluster_scale_test.go).
+	svc := NewClusterWriteService(base, &fakeReader{}, NewApplyService(applier, sink), defaultNS)
 	return svc, sink
 }
 

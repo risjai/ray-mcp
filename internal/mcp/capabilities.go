@@ -62,16 +62,18 @@ var curatedClusterFields = []string{
 
 // enabledTiers derives the enabled tool tiers from config. It is pure (no I/O)
 // so it can be unit-tested directly. The read tier is always on; write requires
-// --allow-mutations; destructive requires --allow-destructive (which itself is
-// only meaningful alongside mutations, but tier reporting mirrors the raw flags
-// — guard composition is enforced elsewhere).
+// --allow-mutations; destructive ADDITIONALLY requires --allow-mutations (spec §6:
+// "destructive tools additionally require --allow-destructive"). So
+// --allow-destructive without --allow-mutations is inert — there is no write tier
+// for it to extend — and is not reported, matching the registration gate (the
+// destructive tools are never registered without mutations either).
 func enabledTiers(cfg *config.Config) []string {
 	tiers := []string{"read"}
 	if cfg.AllowMutations {
 		tiers = append(tiers, "write")
-	}
-	if cfg.AllowDestructive {
-		tiers = append(tiers, "destructive")
+		if cfg.AllowDestructive {
+			tiers = append(tiers, "destructive")
+		}
 	}
 	return tiers
 }

@@ -108,7 +108,7 @@ func (f *fakeKubeRay) GetService(_ context.Context, namespace, name string) (Ser
 	return s, nil
 }
 
-func (f *fakeKubeRay) Apply(_ context.Context, _ Kind, _, _ string, spec MergedSpec, _ bool) (MergedSpec, error) {
+func (f *fakeKubeRay) Apply(_ context.Context, _ Kind, _, _ string, spec MergedSpec, _ ApplyOptions) (MergedSpec, error) {
 	f.applied = spec
 
 	return spec, nil

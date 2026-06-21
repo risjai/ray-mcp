@@ -31,7 +31,7 @@ import (
 func newClusterWriteService(t *testing.T, adapter *Client) *domain.ClusterWriteService {
 	t.Helper()
 	apply := domain.NewApplyService(adapter, observability.NewAuditLogger(discardWriter{}))
-	return domain.NewClusterWriteService(adapter, apply, "default")
+	return domain.NewClusterWriteService(adapter, adapter, apply, "default")
 }
 
 // curatedCreateParams builds a minimal valid curated create for the given

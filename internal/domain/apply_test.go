@@ -8,19 +8,23 @@ import (
 )
 
 // applyCall records one invocation of the fake Applier so tests can assert the
-// pipeline's call sequence (the unconditional dry-run, then the commit).
+// pipeline's call sequence (the unconditional dry-run, then the commit) and the
+// force flag on a conflict-retry commit.
 type applyCall struct {
 	kind      Kind
 	namespace string
 	name      string
 	spec      MergedSpec
 	dryRun    bool
+	force     bool
 }
 
 // fakeApplier is a programmable Applier for the pure ApplyService tests. It
 // records every call and returns a per-(dryRun) canned object or error, so a
 // test can make the dry-run fail or return a distinct object while the commit
-// returns the read-back.
+// returns the read-back. commitConflictOnce makes the FIRST committing apply
+// return a ConflictError (and subsequent commits succeed), to exercise the
+// update/scale force-on-conflict retry.
 type fakeApplier struct {
 	calls []applyCall
 
@@ -28,12 +32,19 @@ type fakeApplier struct {
 	applyObj  MergedSpec
 	dryRunErr error
 	applyErr  error
+
+	commitConflictOnce bool
+	commitCount        int
 }
 
-func (f *fakeApplier) Apply(_ context.Context, kind Kind, namespace, name string, spec MergedSpec, dryRun bool) (MergedSpec, error) {
-	f.calls = append(f.calls, applyCall{kind: kind, namespace: namespace, name: name, spec: spec, dryRun: dryRun})
-	if dryRun {
+func (f *fakeApplier) Apply(_ context.Context, kind Kind, namespace, name string, spec MergedSpec, opts ApplyOptions) (MergedSpec, error) {
+	f.calls = append(f.calls, applyCall{kind: kind, namespace: namespace, name: name, spec: spec, dryRun: opts.DryRun, force: opts.Force})
+	if opts.DryRun {
 		return f.dryRunObj, f.dryRunErr
+	}
+	f.commitCount++
+	if f.commitConflictOnce && f.commitCount == 1 {
+		return nil, &ConflictError{Kind: kind, Namespace: namespace, Name: name, Detail: "co-owned by ray-autoscaler"}
 	}
 	return f.applyObj, f.applyErr
 }

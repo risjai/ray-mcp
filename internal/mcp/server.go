@@ -40,8 +40,8 @@ func NewServer(cfg *config.Config, src capabilitiesSource, kube domain.ClusterRe
 
 	if cfg.AllowMutations {
 		applySvc := domain.NewApplyService(write, audit)
-		writeSvc := domain.NewClusterWriteService(write, applySvc, cfg.DefaultNamespace)
-		addClusterWriteTools(server, writeSvc, cfg.AllowRawSpec)
+		writeSvc := domain.NewClusterWriteService(write, kube, applySvc, cfg.DefaultNamespace)
+		addClusterWriteTools(server, writeSvc, cfg.AllowRawSpec, cfg.AllowDestructive)
 	}
 
 	return server

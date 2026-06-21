@@ -32,10 +32,12 @@ type KubeRayPort interface {
 
 	// Apply is the unified write path for create/update/scale/deploy: it applies
 	// the merged unstructured spec for the given Kind via Server-Side Apply with
-	// the "ray-mcp" field manager. When dryRun is true it maps to DryRunAll and
-	// the API server validates against the installed CRD schema without
-	// persisting. Returns the applied (or dry-run) object as a plain map.
-	Apply(ctx context.Context, kind Kind, namespace, name string, spec MergedSpec, dryRun bool) (MergedSpec, error)
+	// the "ray-mcp" field manager. opts.DryRun maps to DryRunAll (validate against
+	// the installed CRD schema without persisting); opts.Force maps to
+	// ForceOwnership (the update/scale conflict-retry knob). Returns the applied
+	// (or dry-run) object as a plain map. (Narrowed to Applier for the apply
+	// pipeline; the full port keeps the same method.)
+	Apply(ctx context.Context, kind Kind, namespace, name string, spec MergedSpec, opts ApplyOptions) (MergedSpec, error)
 
 	// Delete removes a resource (the destructive tier). When dryRun is true it
 	// validates the delete without persisting.
