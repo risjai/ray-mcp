@@ -598,14 +598,21 @@ Google" — not Anthropic-maintained; don't mislabel.)
   - **B2** Q5's unconditional `DryRunAll` partly obsoletes Q4's CRD-schema-read +
     its ClusterRole — reconsider whether that extra privilege earns its keep or
     demotes to optional capability-reporting.
-  - **B3** "destructive" overloaded for *registration tier* vs. *runtime confirm*;
-    scale-to-zero is `--allow-mutations`-gated but confirm-only — decide if it
-    needs `--allow-destructive`. Couples to Q16a.
+  - **B3** ✅ RESOLVED 2026-06-19 — "destructive" was overloaded for *registration
+    tier* vs. *runtime confirm*. **Decision: scale-to-zero requires BOTH
+    `--allow-destructive` (tier) AND the confirm-fingerprint**, not confirm alone:
+    the confirm-fingerprint is a stateless handshake an autonomous agent can
+    satisfy itself, so only the boot-time tier flag is an agent-proof guard, and a
+    scale-to-zero (deleting all head+worker pods) is a teardown that belongs behind
+    the same wall as delete. A non-zero scale stays a plain write. Couples to Q16a.
   - **C3** curated params thin for GPU Ray (no `rayStartParams`/`tolerations`/
     `nodeSelector`) → `--allow-raw-spec=false` hard mode unusable in the core GPU
     case; grow curated params or document the limit.
-  - **C4** status-distillation (the wedge crown jewel) is under-specified — needs
-    its own design note (inputs, RBAC, concrete examples).
+  - **C4** ✅ ADDRESSED 2026-06-20 — status-distillation (the wedge crown jewel)
+    was under-specified; now has its own design note (inputs per kind, RBAC,
+    concrete examples, and the cross-kind seam): `ray-mcp-distillation-design.md`.
+    Resolves the architecture review's Candidate 1 (name the distillation seam
+    before RayJob lands). Implementation lands with the RayJob task.
 
 **Not yet grilled (candidate future questions):**
 - RayService zero-downtime **update** semantics — what the tool exposes, how
