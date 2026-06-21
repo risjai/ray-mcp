@@ -101,7 +101,7 @@ func addClusterWriteTools(server *mcp.Server, svc *domain.ClusterWriteService, a
 
 		res, err := svc.Create(ctx, toCreateParams(in))
 		if err != nil {
-			return nil, ClusterCreateOutput{}, mapClusterWriteError(err) //nolint:wrapcheck // mapped to a clean, bounded tool error.
+			return nil, ClusterCreateOutput{}, mapDomainError(err) //nolint:wrapcheck // mapped to a clean, bounded tool error.
 		}
 
 		out := toClusterCreateOutput(in.Name, resolvedNamespace(in.Namespace, svc), res)
@@ -249,26 +249,4 @@ func fieldChangeHeadline(c fieldChangeOutput) string {
 	default:
 		return c.Path
 	}
-}
-
-// mapClusterWriteError maps a domain write error to a clean, bounded MCP tool
-// error. Typed domain errors (Identity/Conflict/Forbidden/NotFound) already carry
-// actionable messages; surface those verbatim rather than a raw dump. An unknown
-// field rejected by Server-Side Apply is surfaced as the adapter's mapped error
-// ("field not declared in schema") — per spec §7.C/Q4 we report it as a REJECTED
-// undeclared field, never as silent pruning.
-func mapClusterWriteError(err error) error {
-	var ident *domain.IdentityError
-	if errors.As(err, &ident) {
-		return errors.New(ident.Error())
-	}
-	var conflict *domain.ConflictError
-	if errors.As(err, &conflict) {
-		return errors.New(conflict.Error())
-	}
-	var forbidden *domain.ForbiddenError
-	if errors.As(err, &forbidden) {
-		return errors.New(forbidden.Error())
-	}
-	return err
 }

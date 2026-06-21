@@ -135,7 +135,7 @@ func addClusterTools(server *mcp.Server, svc *domain.ClusterService) {
 			Verbose:   in.Verbose,
 		})
 		if err != nil {
-			return nil, ClusterGetOutput{}, mapClusterGetError(err) //nolint:wrapcheck // mapped to a clean, bounded tool error.
+			return nil, ClusterGetOutput{}, mapDomainError(err) //nolint:wrapcheck // mapped to a clean, bounded tool error.
 		}
 
 		out := toClusterGetOutput(res)
@@ -159,7 +159,7 @@ func addClusterTools(server *mcp.Server, svc *domain.ClusterService) {
 			Limit:     in.Limit,
 		})
 		if err != nil {
-			return nil, ClusterEventsOutput{}, mapClusterGetError(err) //nolint:wrapcheck // mapped to a clean, bounded tool error.
+			return nil, ClusterEventsOutput{}, mapDomainError(err) //nolint:wrapcheck // mapped to a clean, bounded tool error.
 		}
 
 		out := toClusterEventsOutput(res)
@@ -284,16 +284,4 @@ func clusterGetSummary(out ClusterGetOutput) string {
 		"RayCluster %q in namespace %q: %s",
 		out.Name, out.Namespace, out.Health,
 	)
-}
-
-// mapClusterGetError maps a domain error to a clean, bounded MCP tool error. A
-// *NotFoundError becomes its actionable message rather than a raw dump; other
-// errors surface their own message verbatim (they are already bounded by the
-// adapter's error taxonomy).
-func mapClusterGetError(err error) error {
-	var nf *domain.NotFoundError
-	if errors.As(err, &nf) {
-		return errors.New(nf.Error())
-	}
-	return err
 }
