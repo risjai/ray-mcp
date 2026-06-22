@@ -478,6 +478,14 @@ autoscaling cluster). [verified: KubeRay autoscaling docs]
    changes it only when explicitly set, and **refuses `replicas` on an autoscaling
    cluster** (set `min`/`max` instead — the autoscaler owns the live count).
    `min`/`max` are ray-mcp-owned bounds and always safe to set.
+   The read also **strips `scaleStrategy.workersToDelete`** from every worker group
+   before applying (like `status`): that field is the autoscaler's transient
+   scale-down command, which KubeRay v1.6.1 actions and then clears **in memory
+   only** (no persisting `Update`), so a populated-but-already-actioned list can
+   linger on the live spec. ray-mcp never authors it, so re-asserting it as
+   ray-mcp-owned intent could re-trigger a targeted pod deletion on the next
+   reconcile — we drop it and leave the field to the autoscaler. [verified: KubeRay
+   v1.6.1 `raycluster_controller.go`, Checkpoint C]
 3. On `Conflict`: because the atomic list means even the autoscaler's JSON-Patch
    write contends, a contended apply conflicts. We **retry once with force from a
    fresh read** — the fresh read re-asserts the autoscaler's current `replicas`, so

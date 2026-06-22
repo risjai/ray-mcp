@@ -267,7 +267,37 @@ func (s *ClusterWriteService) readForWrite(ctx context.Context, namespace, name 
 		spec = map[string]any{}
 		obj["spec"] = spec
 	}
+	stripWorkersToDelete(spec)
 	return obj, spec, nil
+}
+
+// stripWorkersToDelete removes spec.workerGroupSpecs[].scaleStrategy.workersToDelete
+// from every worker group before the apply. That field is transient command state
+// the Ray autoscaler/KubeRay author and the operator consumes — never declarative
+// intent ray-mcp owns. KubeRay v1.6.1 deletes the named pods unconditionally
+// ("regardless of the value of Replicas") and then clears the slice IN MEMORY ONLY
+// (no persisting Update in the reconcile path), so an already-actioned list can
+// linger on the live spec. If a read-modify-apply re-asserted it as ray-mcp-owned
+// intent, the operator would honor it again on the next reconcile and could delete
+// a pod whose name recurred after a scale-up. ray-mcp never authors workersToDelete,
+// so we drop it (like status) and let the autoscaler keep ownership of the field. An
+// emptied scaleStrategy map is removed so the apply body carries no empty husk.
+func stripWorkersToDelete(spec map[string]any) {
+	groups, _ := spec["workerGroupSpecs"].([]any)
+	for _, g := range groups {
+		wg, ok := g.(map[string]any)
+		if !ok {
+			continue
+		}
+		ss, ok := wg["scaleStrategy"].(map[string]any)
+		if !ok {
+			continue
+		}
+		delete(ss, "workersToDelete")
+		if len(ss) == 0 {
+			delete(wg, "scaleStrategy")
+		}
+	}
 }
 
 // specIsAutoscaling reports whether spec.enableInTreeAutoscaling is true.
