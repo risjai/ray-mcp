@@ -39,7 +39,7 @@ func newWriteService(base ClusterBaseBuilder, applier Applier, defaultNS string)
 	sink := &recordingSink{}
 	// Create does not read the live object, so a zero-value reader is unused here;
 	// update/scale wire a real ClusterGetter (see cluster_scale_test.go).
-	svc := NewClusterWriteService(base, &fakeReader{}, NewApplyService(applier, sink), defaultNS)
+	svc := NewClusterWriteService(base, &fakeReader{}, &fakeKubeRay{clusters: map[string]ClusterDetail{}}, NewApplyService(applier, sink), defaultNS)
 	return svc, sink
 }
 
@@ -180,3 +180,239 @@ func TestCreateBaseBuildErrorStops(t *testing.T) {
 
 // compile-time proof the fake satisfies the base-builder port.
 var _ ClusterBaseBuilder = (*fakeBaseBuilder)(nil)
+
+// --- Delete tests ----------------------------------------------------------
+
+// fakeDeleter is a programmable Deleter for the delete unit tests: it records
+// calls and can return a configurable error.
+type fakeDeleter struct {
+	calls []deleteCall
+	err   error
+}
+
+type deleteCall struct {
+	kind      Kind
+	namespace string
+	name      string
+	dryRun    bool
+}
+
+func (f *fakeDeleter) Delete(_ context.Context, kind Kind, namespace, name string, dryRun bool) error {
+	f.calls = append(f.calls, deleteCall{kind: kind, namespace: namespace, name: name, dryRun: dryRun})
+	return f.err
+}
+
+// compile-time proof the test deleter satisfies the port.
+var _ Deleter = (*fakeDeleter)(nil)
+
+// newDeleteService wires a ClusterWriteService with a seeded fake reader (so
+// GetCluster returns it) and a recording audit sink, for the delete tests.
+func newDeleteService(detail ClusterDetail, deleter *fakeDeleter) (*ClusterWriteService, *recordingSink) {
+	reader := &fakeReader{detail: detail}
+	sink := &recordingSink{}
+	applySvc := NewApplyService(&fakeApplier{}, sink)
+	svc := NewClusterWriteService(&fakeBaseBuilder{}, reader, deleter, applySvc, "default")
+	return svc, sink
+}
+
+// seededCluster builds a ClusterDetail with metadata.uid for a non-trivial
+// fingerprint, optionally protected.
+func seededCluster(namespace, name, uid string, protected bool) ClusterDetail {
+	meta := map[string]any{"name": name, "namespace": namespace, "uid": uid}
+	if protected {
+		meta["annotations"] = map[string]any{ProtectedAnnotation: "true"}
+	}
+	raw := MergedSpec{
+		"apiVersion": "ray.io/v1",
+		"kind":       "RayCluster",
+		"metadata":   meta,
+		"spec":       map[string]any{"rayVersion": "2.9.0"},
+	}
+	return ClusterDetail{ClusterSummary: ClusterSummary{Name: name, Namespace: namespace}, Raw: raw}
+}
+
+// TestClusterDeletePreviewReturnsFingerprint asserts an empty confirm (the preview
+// call) returns a ConfirmRequiredError carrying the correct fingerprint derived
+// from the live object, and no delete is recorded.
+func TestClusterDeletePreviewReturnsFingerprint(t *testing.T) {
+	t.Parallel()
+	detail := seededCluster("default", "demo", "uid-123", false)
+	deleter := &fakeDeleter{}
+	svc, _ := newDeleteService(detail, deleter)
+
+	err := svc.Delete(context.Background(), ClusterDeleteParams{Name: "demo"})
+	var required *ConfirmRequiredError
+	if !errors.As(err, &required) {
+		t.Fatalf("Delete error = %v, want *ConfirmRequiredError", err)
+	}
+	want := Fingerprint(detail.Raw, OpDelete)
+	if required.Fingerprint != want {
+		t.Errorf("fingerprint = %q, want %q", required.Fingerprint, want)
+	}
+	if len(deleter.calls) != 0 {
+		t.Errorf("deleter called %d times, want 0 (preview only)", len(deleter.calls))
+	}
+}
+
+// TestClusterDeleteCommitWithMatchingConfirm asserts a matching confirm proceeds
+// to delete and records the delete with the correct namespace/name.
+func TestClusterDeleteCommitWithMatchingConfirm(t *testing.T) {
+	t.Parallel()
+	detail := seededCluster("default", "demo", "uid-123", false)
+	deleter := &fakeDeleter{}
+	svc, _ := newDeleteService(detail, deleter)
+
+	fp := Fingerprint(detail.Raw, OpDelete)
+	err := svc.Delete(context.Background(), ClusterDeleteParams{Name: "demo", Confirm: fp})
+	if err != nil {
+		t.Fatalf("Delete with matching confirm: %v", err)
+	}
+	if len(deleter.calls) != 1 {
+		t.Fatalf("deleter calls = %d, want 1", len(deleter.calls))
+	}
+	if deleter.calls[0].namespace != "default" || deleter.calls[0].name != "demo" {
+		t.Errorf("delete target = %s/%s, want default/demo", deleter.calls[0].namespace, deleter.calls[0].name)
+	}
+	if deleter.calls[0].kind != KindRayCluster {
+		t.Errorf("delete kind = %s, want RayCluster", deleter.calls[0].kind)
+	}
+}
+
+// TestClusterDeleteMismatchRejected asserts a wrong confirm is rejected with
+// ConfirmMismatchError and no delete is recorded.
+func TestClusterDeleteMismatchRejected(t *testing.T) {
+	t.Parallel()
+	detail := seededCluster("default", "demo", "uid-123", false)
+	deleter := &fakeDeleter{}
+	svc, _ := newDeleteService(detail, deleter)
+
+	err := svc.Delete(context.Background(), ClusterDeleteParams{Name: "demo", Confirm: "wrong-fingerprint"})
+	var mismatch *ConfirmMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("Delete error = %v, want *ConfirmMismatchError", err)
+	}
+	if len(deleter.calls) != 0 {
+		t.Errorf("deleter called %d times, want 0 (mismatch rejected)", len(deleter.calls))
+	}
+}
+
+// TestClusterDeleteProtectedRefused asserts a protected cluster refuses deletion
+// (both preview and commit), and no delete is recorded. The protected check
+// comes BEFORE confirm so a protected cluster never yields a working fingerprint.
+func TestClusterDeleteProtectedRefused(t *testing.T) {
+	t.Parallel()
+	detail := seededCluster("default", "demo", "uid-456", true)
+	deleter := &fakeDeleter{}
+	svc, _ := newDeleteService(detail, deleter)
+
+	// Preview (empty confirm) → protected error, not a fingerprint.
+	err := svc.Delete(context.Background(), ClusterDeleteParams{Name: "demo"})
+	if err == nil {
+		t.Fatal("Delete (preview) on protected cluster returned nil, want error")
+	}
+	var required *ConfirmRequiredError
+	if errors.As(err, &required) {
+		t.Fatal("protected cluster returned a ConfirmRequiredError; the protected check must precede the confirm gate")
+	}
+
+	// Commit with a (would-be valid) fingerprint → still refused.
+	fp := Fingerprint(detail.Raw, OpDelete)
+	err = svc.Delete(context.Background(), ClusterDeleteParams{Name: "demo", Confirm: fp})
+	if err == nil {
+		t.Fatal("Delete (commit) on protected cluster returned nil, want error")
+	}
+	if len(deleter.calls) != 0 {
+		t.Errorf("deleter called %d times, want 0 (protected refused)", len(deleter.calls))
+	}
+}
+
+// TestClusterDeleteDryRunPassesThrough asserts a matching confirm with DryRun=true
+// passes the dryRun flag to the Deleter.
+func TestClusterDeleteDryRunPassesThrough(t *testing.T) {
+	t.Parallel()
+	detail := seededCluster("default", "demo", "uid-789", false)
+	deleter := &fakeDeleter{}
+	svc, _ := newDeleteService(detail, deleter)
+
+	fp := Fingerprint(detail.Raw, OpDelete)
+	err := svc.Delete(context.Background(), ClusterDeleteParams{Name: "demo", Confirm: fp, DryRun: true})
+	if err != nil {
+		t.Fatalf("Delete(dryRun): %v", err)
+	}
+	if len(deleter.calls) != 1 || !deleter.calls[0].dryRun {
+		t.Fatalf("deleter calls = %+v, want one call with dryRun=true", deleter.calls)
+	}
+}
+
+// TestClusterDeleteNotFound asserts a missing cluster propagates NotFoundError.
+func TestClusterDeleteNotFound(t *testing.T) {
+	t.Parallel()
+	reader := &fakeReader{err: &NotFoundError{Kind: KindRayCluster, Namespace: "default", Name: "gone"}}
+	sink := &recordingSink{}
+	applySvc := NewApplyService(&fakeApplier{}, sink)
+	deleter := &fakeDeleter{}
+	svc := NewClusterWriteService(&fakeBaseBuilder{}, reader, deleter, applySvc, "default")
+
+	err := svc.Delete(context.Background(), ClusterDeleteParams{Name: "gone"})
+	var nf *NotFoundError
+	if !errors.As(err, &nf) {
+		t.Fatalf("Delete error = %v, want *NotFoundError", err)
+	}
+	if len(deleter.calls) != 0 {
+		t.Errorf("deleter called %d times, want 0 (cluster not found)", len(deleter.calls))
+	}
+}
+
+// TestClusterDeleteAuditEmitted asserts exactly one audit record is emitted on a
+// successful delete (commit), with the correct tool name and outcome; and that a
+// failing delete also emits one record with outcome=failure.
+func TestClusterDeleteAuditEmitted(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success", func(t *testing.T) {
+		t.Parallel()
+		detail := seededCluster("default", "demo", "uid-audit", false)
+		deleter := &fakeDeleter{}
+		svc, sink := newDeleteService(detail, deleter)
+
+		fp := Fingerprint(detail.Raw, OpDelete)
+		if err := svc.Delete(context.Background(), ClusterDeleteParams{Name: "demo", Confirm: fp}); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if len(sink.records) != 1 {
+			t.Fatalf("audit records = %d, want 1", len(sink.records))
+		}
+		rec := sink.records[0]
+		if rec.Tool != "ray_cluster_delete" {
+			t.Errorf("audit Tool = %q, want ray_cluster_delete", rec.Tool)
+		}
+		if rec.Outcome != AuditOutcomeSuccess {
+			t.Errorf("audit Outcome = %q, want success", rec.Outcome)
+		}
+		if rec.Kind != KindRayCluster || rec.Namespace != "default" || rec.Name != "demo" {
+			t.Errorf("audit target = %s %s/%s, want RayCluster default/demo", rec.Kind, rec.Namespace, rec.Name)
+		}
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		t.Parallel()
+		detail := seededCluster("default", "demo", "uid-audit-fail", false)
+		deleter := &fakeDeleter{err: errors.New("kube error")}
+		svc, sink := newDeleteService(detail, deleter)
+
+		fp := Fingerprint(detail.Raw, OpDelete)
+		err := svc.Delete(context.Background(), ClusterDeleteParams{Name: "demo", Confirm: fp})
+		if err == nil {
+			t.Fatal("Delete returned nil, want the deleter error")
+		}
+		if len(sink.records) != 1 {
+			t.Fatalf("audit records = %d, want 1", len(sink.records))
+		}
+		if sink.records[0].Outcome != AuditOutcomeFailure {
+			t.Errorf("audit Outcome = %q, want failure", sink.records[0].Outcome)
+		}
+		if sink.records[0].Error == "" {
+			t.Error("audit Error is empty, want the bounded failure message")
+		}
+	})
+}

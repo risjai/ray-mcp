@@ -12,12 +12,14 @@ import (
 )
 
 // liveBackend extends the fake write backend with a GetCluster returning a canned
-// live object, so the update/scale read-modify-apply path has something to read.
-// It embeds fakeWriteBackend for BuildClusterBase + Apply.
+// live object, so the update/scale/delete read-modify-apply path has something to
+// read. It embeds fakeWriteBackend for BuildClusterBase + Apply + Delete.
 type liveBackend struct {
 	fakeWriteBackend
 	autoscaling bool
 	getErr      error
+	protected   bool
+	uid         string // if set, injected into metadata.uid of the canned object.
 }
 
 // ListClusters + Events satisfy domain.ClusterReader (unused by update/scale; the
@@ -57,11 +59,18 @@ func (b *liveBackend) GetCluster(_ context.Context, namespace, name string) (dom
 	if b.autoscaling {
 		spec["enableInTreeAutoscaling"] = true
 	}
+	meta := map[string]any{"name": name, "namespace": namespace}
+	if b.uid != "" {
+		meta["uid"] = b.uid
+	}
+	if b.protected {
+		meta["annotations"] = map[string]any{domain.ProtectedAnnotation: "true"}
+	}
 	return domain.ClusterDetail{
 		ClusterSummary: domain.ClusterSummary{Name: name, Namespace: namespace},
 		Raw: domain.MergedSpec{
 			"apiVersion": "ray.io/v1", "kind": "RayCluster",
-			"metadata": map[string]any{"name": name, "namespace": namespace},
+			"metadata": meta,
 			"spec":     spec,
 		},
 	}, nil

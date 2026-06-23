@@ -31,6 +31,10 @@ func TestMapDomainErrorRendersFullTaxonomyCleanly(t *testing.T) {
 		{"Identity", &domain.IdentityError{Field: "name", Want: "demo", Got: "evil"}},
 		{"RayAPIUnreachable", &domain.RayAPIUnreachableError{Endpoint: "http://head:8265", Reason: "connection refused"}},
 		{"Timeout", &domain.TimeoutError{Op: "JobStatus"}},
+		// ConfirmMismatchError is in the taxonomy (wrong/stale confirm on a destructive op).
+		// ConfirmRequiredError is NOT: it is intercepted at the tool layer as a successful
+		// preview and never flows through mapDomainError.
+		{"ConfirmMismatch", &domain.ConfirmMismatchError{Operation: domain.OpDelete}},
 	}
 
 	for _, tc := range cases {

@@ -115,6 +115,9 @@ func addClusterWriteTools(server *mcp.Server, svc *domain.ClusterWriteService, a
 
 	addClusterUpdateTool(server, svc, allowRawSpec)
 	addClusterScaleTool(server, svc, allowDestructive)
+	if allowDestructive {
+		addClusterDeleteTool(server, svc)
+	}
 }
 
 // clusterCreateInputSchema returns the advertised input schema for

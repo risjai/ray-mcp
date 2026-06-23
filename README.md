@@ -8,9 +8,10 @@ Read-only today; a guarded write path is on the way (see below).
 ![Go](https://img.shields.io/badge/go-1.26.3-00ADD8)
 ![Status](https://img.shields.io/badge/status-v0.1.0%20preview-orange)
 
-> **Status: v0.1.0 — read-only preview.** Today: `ray_capabilities` +
-> `ray_cluster_list` / `ray_cluster_get` / `ray_cluster_events`, over stdio.
-> Write/destructive tiers and Ray job/service tools are landing iteratively.
+> **Status: v0.1.0 preview.** Today: `ray_capabilities`, the RayCluster read tools
+> (`ray_cluster_list` / `ray_cluster_get` / `ray_cluster_events`), and the full
+> guarded RayCluster write path (`create` / `update` / `scale` / `delete`), over
+> stdio. The wedge (Ray dashboard/job API) and Ray job/service tools land next.
 
 ## Why ray-mcp
 
@@ -27,17 +28,21 @@ YAML. ray-mcp is built specifically for Ray, with the LLM as the consumer.
 - **Read-only and token-bounded by default.** Safe to point at any cluster — no
   tool can mutate it. Output is compact and capped (small list rows, bounded event
   slices), because the consumer is an LLM with a finite context budget.
+- **Guarded writes, opt-in by tier.** The full RayCluster write path —
+  `create` / `update` / `scale` / `delete` — ships behind `--allow-mutations`
+  (destructive ops additionally need `--allow-destructive`), via Server-Side Apply
+  with dry-run, before/after diffs, and a stateless **confirm-fingerprint** two-step
+  on destructive ops. The `ray-mcp/protected` annotation refuses deletion, and
+  writes only ever go through the guarded CRD path — the unauthenticated Ray
+  dashboard is never a write vector.
 
 **On the roadmap (designed, not yet built):**
 
 - **The wedge** — a read-only reach into Ray's dashboard/job API for live job
   status and logs, the runtime detail the CRDs don't hold (this is where the
   distillation above extends to jobs: *"why is my job pending?"*).
-- **Guarded writes** — `delete` (destructive tier + confirm-fingerprint) rounds out
-  the create / update / scale write path already shipped via Server-Side Apply with
-  dry-run, before/after diffs, and tiered safety gates
-  (`--allow-mutations` → `--allow-destructive`). The unauthenticated Ray dashboard
-  is never a write vector — writes only ever go through the guarded CRD path.
+- **Ray job / service tools** — submit / get / logs / wait / list / delete for
+  RayJob and RayService, layered on the guarded write path below.
 
 ## Install
 
@@ -128,7 +133,7 @@ Needs Docker + kubectl + Go + Claude Code; ~20–30 min; fully disposable.
 | RayCluster events — `ray_cluster_events` (Warnings-first) | ✅ Shipped (v0.1.0) |
 | RayCluster create — `ray_cluster_create` (unified apply pipeline, SSA, dry-run, diffs) | ✅ Shipped (`--allow-mutations`) |
 | RayCluster writes — update / scale (SSA, dry-run, diffs, autoscaler-safe) | ✅ Shipped (`--allow-mutations`) |
-| RayCluster delete — destructive tier + confirm-fingerprint | 🚧 Next |
+| RayCluster delete — `ray_cluster_delete` (destructive tier, two-step confirm-fingerprint, `protected` guard) | ✅ Shipped (`--allow-destructive`) |
 | The wedge — read-only Ray dashboard/job API reach (live status) | 📋 Planned |
 | RayJob tools — submit / get / logs / wait / list / delete | 📋 Planned |
 | RayService tools — deploy / update / list / get / delete | 📋 Planned |
