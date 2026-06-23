@@ -81,7 +81,7 @@ func (f *fakeReader) GetCluster(_ context.Context, namespace, name string) (Clus
 func newScaleService(reader ClusterGetter, applier Applier, defaultNS string) (*ClusterWriteService, *fakeApplier, *recordingSink) {
 	fa, _ := applier.(*fakeApplier)
 	sink := &recordingSink{}
-	svc := NewClusterWriteService(&fakeBaseBuilder{}, reader, NewApplyService(applier, sink), defaultNS)
+	svc := NewClusterWriteService(&fakeBaseBuilder{}, reader, &fakeKubeRay{clusters: map[string]ClusterDetail{}}, NewApplyService(applier, sink), defaultNS)
 	return svc, fa, sink
 }
 

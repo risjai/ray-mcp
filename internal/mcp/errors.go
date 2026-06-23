@@ -42,5 +42,9 @@ func mapDomainError(err error) error {
 	if errors.As(err, &timeout) {
 		return errors.New(timeout.Error())
 	}
+	var mismatch *domain.ConfirmMismatchError
+	if errors.As(err, &mismatch) {
+		return errors.New(mismatch.Error())
+	}
 	return err
 }

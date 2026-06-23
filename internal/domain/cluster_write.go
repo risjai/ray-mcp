@@ -76,6 +76,23 @@ type ClusterBaseBuilder interface {
 	BuildClusterBase(p ClusterCreateParams) (MergedSpec, error)
 }
 
+// Deleter is the narrow destructive slice of KubeRayPort the delete pipeline
+// needs: a single Delete parameterized by Kind, with a dryRun flag. The KubeRay
+// adapter and the full port satisfy it; domain tests inject a fake.
+type Deleter interface {
+	Delete(ctx context.Context, kind Kind, namespace, name string, dryRun bool) error
+}
+
+// ClusterDeleteParams is the decoded ray_cluster_delete argument set: the target
+// identity, the confirm fingerprint (empty for preview, echoed back for commit),
+// and the dryRun flag (server-side validation without persisting the deletion).
+type ClusterDeleteParams struct {
+	Namespace string
+	Name      string
+	Confirm   string
+	DryRun    bool
+}
+
 // ClusterWriteService is the orchestration layer for the RayCluster write tools.
 // It owns the cross-cutting write policy the MCP layer must not duplicate: the
 // default-namespace fallback, the curated→base→merge→apply sequence, and the
@@ -84,16 +101,17 @@ type ClusterBaseBuilder interface {
 type ClusterWriteService struct {
 	base             ClusterBaseBuilder
 	get              ClusterGetter
+	del              Deleter
 	apply            *ApplyService
 	defaultNamespace string
 }
 
 // NewClusterWriteService builds the service over the base builder (create), the
-// live-object reader (update/scale read-modify-apply-full), the apply pipeline
-// (Task 8b), and the default namespace (injected as a plain string so the domain
-// stays config/k8s-free).
-func NewClusterWriteService(base ClusterBaseBuilder, get ClusterGetter, apply *ApplyService, defaultNamespace string) *ClusterWriteService {
-	return &ClusterWriteService{base: base, get: get, apply: apply, defaultNamespace: defaultNamespace}
+// live-object reader (update/scale read-modify-apply-full), the deleter
+// (destructive tier), the apply pipeline (Task 8b), and the default namespace
+// (injected as a plain string so the domain stays config/k8s-free).
+func NewClusterWriteService(base ClusterBaseBuilder, get ClusterGetter, del Deleter, apply *ApplyService, defaultNamespace string) *ClusterWriteService {
+	return &ClusterWriteService{base: base, get: get, del: del, apply: apply, defaultNamespace: defaultNamespace}
 }
 
 // Create runs the create half of the unified apply pipeline for one RayCluster:
@@ -148,6 +166,50 @@ func (s *ClusterWriteService) resolveNamespace(ns string) string {
 // layer can echo the real target namespace in its result.
 func (s *ClusterWriteService) DefaultNamespace() string {
 	return s.defaultNamespace
+}
+
+// Delete runs the destructive delete pipeline for one RayCluster: confirm-
+// fingerprint gated, protected-annotation guarded, audit-carrying. The two-step
+// flow (preview → commit) is stateless: the fingerprint is recomputed from the
+// live object on every call; no cross-call state is stored.
+//
+//  1. Resolve namespace + require name.
+//  2. Read the live object (GetCluster) — NotFound propagates.
+//  3. Protected check (before confirm, so a protected cluster NEVER yields a
+//     working fingerprint — spec §7, Q10).
+//  4. RequireConfirm gate — empty confirm returns a preview (ConfirmRequiredError
+//     carrying the fingerprint); matching confirm proceeds; wrong/stale confirm
+//     returns ConfirmMismatchError.
+//  5. On matching confirm: call the Deleter, emit one audit record (success or
+//     failure), return.
+func (s *ClusterWriteService) Delete(ctx context.Context, p ClusterDeleteParams) error {
+	p.Namespace = s.resolveNamespace(p.Namespace)
+	if p.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+
+	detail, err := s.get.GetCluster(ctx, p.Namespace, p.Name)
+	if err != nil {
+		return err
+	}
+
+	if IsProtected(detail.Raw) {
+		return fmt.Errorf("deletion refused: RayCluster %q is protected (ray-mcp/protected=%q); remove the annotation via ray_cluster_update first", p.Name, "true")
+	}
+
+	if err := RequireConfirm(detail.Raw, OpDelete, p.Confirm); err != nil {
+		return err
+	}
+
+	delErr := s.del.Delete(ctx, KindRayCluster, p.Namespace, p.Name, p.DryRun)
+	s.apply.RecordDestructive(ctx, "ray_cluster_delete", KindRayCluster, p.Namespace, p.Name, deleteArgsSummary(p), p.DryRun, delErr)
+	return delErr
+}
+
+// deleteArgsSummary builds the short, bounded audit summary for a delete (spec §8,
+// Q8: a summary, never the full spec — and never the fingerprint).
+func deleteArgsSummary(p ClusterDeleteParams) string {
+	return fmt.Sprintf("name=%s dryRun=%t", p.Name, p.DryRun)
 }
 
 // createArgsSummary builds the short, bounded audit summary for a create (spec §8,

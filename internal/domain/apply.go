@@ -158,6 +158,29 @@ func (s *ApplyService) Apply(ctx context.Context, req ApplyRequest) (ApplyResult
 	}, nil
 }
 
+// RecordDestructive emits one audit record for a destructive op (delete) that does
+// not flow through the Apply pipeline but must still be audited (spec §8). It
+// reuses the same AuditSink + outcome mapping as the apply choke point, so audit
+// format is uniform across all mutations. It is exported so ClusterWriteService
+// (which holds *ApplyService) can call it from its Delete method.
+func (s *ApplyService) RecordDestructive(ctx context.Context, tool string, kind Kind, namespace, name, argsSummary string, dryRun bool, err error) {
+	o := auditSuccess()
+	if err != nil {
+		o = auditFailure(err)
+	}
+	s.audit.Record(ctx, AuditRecord{
+		Caller:      CallerFromContext(ctx),
+		Tool:        tool,
+		Kind:        kind,
+		Namespace:   namespace,
+		Name:        name,
+		ArgsSummary: argsSummary,
+		DryRun:      dryRun,
+		Outcome:     o.outcome,
+		Error:       o.errMsg,
+	})
+}
+
 // emit writes one audit record for an apply attempt, filling caller identity from
 // the context (the transport sets it; stdio leaves the default). It never returns
 // an error: a failed audit write must not mask the apply outcome, and the sink

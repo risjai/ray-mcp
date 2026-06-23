@@ -12,16 +12,32 @@ import (
 )
 
 // fakeWriteBackend is a programmable ClusterWriteBackend (BuildClusterBase +
-// Apply) for the MCP write-path tests. It builds a minimal identity-carrying base
-// and echoes the applied spec back as the server view, optionally injecting an
-// extra "added" field so the diff is non-empty. It records every Apply so a test
-// can assert the dry-run/commit sequence the tool drove.
+// Apply + Delete) for the MCP write-path tests. It builds a minimal
+// identity-carrying base and echoes the applied spec back as the server view,
+// optionally injecting an extra "added" field so the diff is non-empty. It
+// records every Apply so a test can assert the dry-run/commit sequence the tool
+// drove. Delete records what was deleted.
 type fakeWriteBackend struct {
 	applyCalls []applyRecord
 	// serverExtra, when set, is merged into the returned object's spec so the
 	// read-back diff surfaces a server-defaulted field.
 	serverExtra map[string]any
 	applyErr    error
+
+	deleteCalls []deleteRecord
+	deleteErr   error
+}
+
+type deleteRecord struct {
+	kind      domain.Kind
+	namespace string
+	name      string
+	dryRun    bool
+}
+
+func (f *fakeWriteBackend) Delete(_ context.Context, kind domain.Kind, namespace, name string, dryRun bool) error {
+	f.deleteCalls = append(f.deleteCalls, deleteRecord{kind: kind, namespace: namespace, name: name, dryRun: dryRun})
+	return f.deleteErr
 }
 
 type applyRecord struct {

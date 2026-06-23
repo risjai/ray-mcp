@@ -9,14 +9,16 @@ import (
 )
 
 // ClusterWriteBackend is the write slice NewServer needs to register the mutating
-// RayCluster tools: the curated→base builder (spec §7.C step 1) and the SSA Applier
-// (Task 8b). The KubeRay adapter satisfies both; they are bundled into one narrow
-// interface so NewServer takes a single backend handle (the adapter) rather than a
-// growing parameter list, and tests can inject a fake. It is only consulted when
+// RayCluster tools: the curated→base builder (spec §7.C step 1), the SSA Applier
+// (Task 8b), and the Deleter (Task 12, destructive tier). The KubeRay adapter
+// satisfies all three; they are bundled into one narrow interface so NewServer
+// takes a single backend handle (the adapter) rather than a growing parameter
+// list, and tests can inject a fake. It is only consulted when
 // cfg.AllowMutations is set.
 type ClusterWriteBackend interface {
 	domain.ClusterBaseBuilder
 	domain.Applier
+	domain.Deleter
 }
 
 // NewServer constructs the MCP server and registers the tools available for the
@@ -40,7 +42,7 @@ func NewServer(cfg *config.Config, src capabilitiesSource, kube domain.ClusterRe
 
 	if cfg.AllowMutations {
 		applySvc := domain.NewApplyService(write, audit)
-		writeSvc := domain.NewClusterWriteService(write, kube, applySvc, cfg.DefaultNamespace)
+		writeSvc := domain.NewClusterWriteService(write, kube, write, applySvc, cfg.DefaultNamespace)
 		addClusterWriteTools(server, writeSvc, cfg.AllowRawSpec, cfg.AllowDestructive)
 	}
 
