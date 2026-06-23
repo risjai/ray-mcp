@@ -132,6 +132,60 @@ func TestUpdateRawSpecWins(t *testing.T) {
 	}
 }
 
+// TestUpdateStripsWorkersToDelete asserts the read-modify-apply path drops
+// spec.workerGroupSpecs[].scaleStrategy.workersToDelete from the apply body.
+// That field is transient command state the Ray autoscaler/KubeRay author and
+// the operator consumes; KubeRay v1.6.1 clears it in-memory only (no persisting
+// Update), so a populated-but-already-actioned list can linger on the live spec.
+// ray-mcp never authors it, so re-asserting it as ray-mcp-owned intent could
+// re-trigger a targeted pod deletion on the next reconcile. We strip it (like
+// status) so ray-mcp declines to own a deletion list it did not issue. The
+// autoscaler-owned live replicas value must still survive.
+func TestUpdateStripsWorkersToDelete(t *testing.T) {
+	t.Parallel()
+	detail := liveCluster("ray", "demo", true, "workers", 4, 1, 5)
+	// Seed a populated, already-actioned workersToDelete on the live worker group.
+	wg := detail.Raw["spec"].(map[string]any)["workerGroupSpecs"].([]any)[0].(map[string]any)
+	wg["scaleStrategy"] = map[string]any{"workersToDelete": []any{"demo-worker-abc12"}}
+	reader := &fakeReader{detail: detail}
+	svc, fa, _ := newScaleService(reader, &fakeApplier{applyObj: MergedSpec{}}, "ray")
+
+	if _, err := svc.Update(context.Background(), ClusterUpdateParams{Name: "demo", Image: "rayproject/ray:2.40.0"}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	applied := firstWorkerGroup(t, fa)
+	if ss, ok := applied["scaleStrategy"].(map[string]any); ok {
+		if _, has := ss["workersToDelete"]; has {
+			t.Errorf("applied worker group carries scaleStrategy.workersToDelete = %v; it must be stripped (ray-mcp never authors it)", ss["workersToDelete"])
+		}
+	}
+	// The autoscaler-owned live replicas value must be untouched by the strip.
+	if applied["replicas"] != int64(4) {
+		t.Errorf("applied replicas = %v, want 4 preserved (strip must not disturb the live value)", applied["replicas"])
+	}
+}
+
+// TestScaleStripsWorkersToDelete asserts the same strip on the scale path: a scale
+// of min/max must not re-assert a stale workersToDelete carried from the live read.
+func TestScaleStripsWorkersToDelete(t *testing.T) {
+	t.Parallel()
+	detail := liveCluster("ray", "demo", false, "workers", 2, 0, 5)
+	wg := detail.Raw["spec"].(map[string]any)["workerGroupSpecs"].([]any)[0].(map[string]any)
+	wg["scaleStrategy"] = map[string]any{"workersToDelete": []any{"demo-worker-xyz"}}
+	reader := &fakeReader{detail: detail}
+	svc, fa, _ := newScaleService(reader, &fakeApplier{applyObj: MergedSpec{}}, "ray")
+
+	if _, err := svc.Scale(context.Background(), ClusterScaleParams{Name: "demo", WorkerGroup: "workers", MaxReplicas: i32(8)}); err != nil {
+		t.Fatalf("Scale: %v", err)
+	}
+	applied := firstWorkerGroup(t, fa)
+	if ss, ok := applied["scaleStrategy"].(map[string]any); ok {
+		if _, has := ss["workersToDelete"]; has {
+			t.Errorf("applied worker group carries scaleStrategy.workersToDelete = %v; it must be stripped", ss["workersToDelete"])
+		}
+	}
+}
+
 // TestUpdateRejectsIdentityRetarget asserts a rawSpec that retargets identity is
 // rejected by the merge identity guard before any apply.
 func TestUpdateRejectsIdentityRetarget(t *testing.T) {

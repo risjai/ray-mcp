@@ -23,6 +23,7 @@ package kuberay
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,6 +72,85 @@ func autoscalerSetsReplicas(ctx context.Context, t *testing.T, k8s client.Client
 	rc.SetName(name)
 	if err := k8s.Patch(ctx, rc, client.RawPatch(types.JSONPatchType, patch), client.FieldOwner("ray-autoscaler")); err != nil {
 		t.Fatalf("autoscaler JSON patch: %v", err)
+	}
+}
+
+// autoscalerSetsWorkersToDelete simulates the Ray autoscaler populating a
+// scale-down deletion list the way the real autoscaler does: a JSON Patch adding
+// spec.workerGroupSpecs[idx].scaleStrategy.workersToDelete, attributed to the
+// autoscaler field manager. KubeRay v1.6.1 deletes those pods and clears the slice
+// IN MEMORY ONLY, so the populated list can persist on the spec — which is the
+// stale state ray-mcp must not re-assert.
+func autoscalerSetsWorkersToDelete(ctx context.Context, t *testing.T, k8s client.Client, namespace, name string, groupIdx int, pods []string) {
+	t.Helper()
+	quoted := make([]string, len(pods))
+	for i, p := range pods {
+		quoted[i] = fmt.Sprintf("%q", p)
+	}
+	patch := []byte(fmt.Sprintf(
+		`[{"op":"add","path":"/spec/workerGroupSpecs/%d/scaleStrategy","value":{"workersToDelete":[%s]}}]`,
+		groupIdx, strings.Join(quoted, ",")))
+	rc := &rayv1.RayCluster{}
+	rc.SetNamespace(namespace)
+	rc.SetName(name)
+	if err := k8s.Patch(ctx, rc, client.RawPatch(types.JSONPatchType, patch), client.FieldOwner("ray-autoscaler")); err != nil {
+		t.Fatalf("autoscaler workersToDelete patch: %v", err)
+	}
+}
+
+// TestUpdateDoesNotReassertWorkersToDelete is the Flag-3 (Checkpoint C) guard
+// end-to-end: when the live spec carries an autoscaler-authored
+// scaleStrategy.workersToDelete (which KubeRay v1.6.1 does not durably clear), a
+// ray-mcp update of an unrelated field (image) must NOT re-assert that deletion
+// list as ray-mcp-owned intent — readForWrite strips it. We assert the persisted
+// object no longer carries workersToDelete after the ray-mcp apply, while the
+// autoscaler's live replicas survive.
+func TestUpdateDoesNotReassertWorkersToDelete(t *testing.T) {
+	adapter, k8s := startAdapter(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const namespace, name = "default", "no-reassert-wtd"
+	svc := seedCluster(ctx, t, adapter, namespace, name, false)
+
+	// Autoscaler drives replicas to 3 and leaves a stale targeted-deletion list.
+	autoscalerSetsReplicas(ctx, t, k8s, namespace, name, 0, 3)
+	autoscalerSetsWorkersToDelete(ctx, t, k8s, namespace, name, 0, []string{"no-reassert-wtd-worker-stale"})
+
+	// Sanity: the live object now carries the populated list (the precondition).
+	pre, err := getRayCluster(ctx, t, k8s, namespace, name)
+	if err != nil {
+		t.Fatalf("get before update: %v", err)
+	}
+	if len(pre.Spec.WorkerGroupSpecs[0].ScaleStrategy.WorkersToDelete) == 0 {
+		t.Fatalf("precondition failed: live workersToDelete is empty, want it populated")
+	}
+
+	// ray-mcp updates only the image. The forced conflict-retry (the autoscaler owns
+	// the atomic list) re-reads and re-applies; readForWrite must strip workersToDelete
+	// on every read, so ray-mcp never re-asserts it.
+	if _, err := svc.Update(ctx, domain.ClusterUpdateParams{
+		Namespace: namespace, Name: name, Image: "rayproject/ray:2.40.0",
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	post, err := getRayCluster(ctx, t, k8s, namespace, name)
+	if err != nil {
+		t.Fatalf("get after update: %v", err)
+	}
+	// ray-mcp owns the worker group element after its apply; it did not re-assert the
+	// stale deletion list, so the field is gone from ray-mcp's intent.
+	if got := post.Spec.WorkerGroupSpecs[0].ScaleStrategy.WorkersToDelete; len(got) != 0 {
+		t.Errorf("workersToDelete = %v after update, want empty (ray-mcp must not re-assert the autoscaler's stale list)", got)
+	}
+	// The autoscaler-set replicas survived the read-modify-apply-full.
+	if got := deref(post.Spec.WorkerGroupSpecs[0].Replicas); got != 3 {
+		t.Errorf("replicas = %d after update, want 3 preserved", got)
+	}
+	// The image change landed.
+	if wc := post.Spec.WorkerGroupSpecs[0].Template.Spec.Containers; len(wc) == 0 || wc[0].Image != "rayproject/ray:2.40.0" {
+		t.Errorf("worker image = %v, want the updated image", wc)
 	}
 }
 
