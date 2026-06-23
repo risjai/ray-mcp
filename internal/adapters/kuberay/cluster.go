@@ -187,19 +187,15 @@ func clusterAge(rc *rayv1.RayCluster) time.Duration {
 // clusterHealth composes a single-line health summary from the phase, the
 // worker-ready/desired counts, and the most relevant condition's
 // reason/message (falling back to the deprecated Status.Reason). It is a glance,
-// not the full status.
+// not the full status. The phase/detail extraction is RayCluster-specific and
+// stays here; the kind-agnostic join is the shared domain composer (status
+// distillation design note §6).
 func clusterHealth(rc *rayv1.RayCluster) string {
-	phase := clusterPhase(rc)
-	parts := []string{
-		phase,
+	return domain.HealthLine(
+		clusterPhase(rc),
 		fmt.Sprintf("%d/%d workers ready", rc.Status.ReadyWorkerReplicas, rc.Status.DesiredWorkerReplicas),
-	}
-
-	if detail := healthDetail(rc); detail != "" {
-		parts = append(parts, detail)
-	}
-
-	return strings.Join(parts, "; ")
+		healthDetail(rc),
+	)
 }
 
 // healthDetail extracts the most relevant reason/message for the health line: a
@@ -218,16 +214,11 @@ func healthDetail(rc *rayv1.RayCluster) string {
 	return rc.Status.Reason
 }
 
-// condReason renders a condition's reason/message compactly for the health line.
+// condReason renders a condition's reason/message compactly for the health
+// line. It bridges the k8s-typed condition to the kind-agnostic domain renderer
+// (status distillation design note §6).
 func condReason(cond *metav1.Condition) string {
-	switch {
-	case cond.Reason != "" && cond.Message != "":
-		return fmt.Sprintf("%s: %s", cond.Reason, cond.Message)
-	case cond.Message != "":
-		return cond.Message
-	default:
-		return cond.Reason
-	}
+	return domain.ConditionReason(cond.Reason, cond.Message)
 }
 
 // dashboardURL synthesizes the in-cluster head dashboard URL from the head
