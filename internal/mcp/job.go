@@ -26,7 +26,9 @@ type jobGetInput struct {
 type JobGetOutput struct {
 	Name             string `json:"name"`
 	Namespace        string `json:"namespace"`
-	Scheduled        bool   `json:"scheduled" jsonschema:"true once status.jobId+dashboardURL are set and the dashboard was dialed; false means not yet scheduled"`
+	Scheduled        bool   `json:"scheduled" jsonschema:"true once status.jobId+dashboardURL are set; false means not yet scheduled"`
+	Degraded         bool   `json:"degraded" jsonschema:"true when the job is scheduled but the live Ray dashboard was unreachable, so this is the CRD-derived view only (live jobStatus/message/timestamps absent)"`
+	DegradeReason    string `json:"degradeReason,omitempty" jsonschema:"when degraded, the bounded reason the live Ray detail was unavailable"`
 	JobID            string `json:"jobId,omitempty" jsonschema:"the Ray submission id (status.jobId); empty before scheduling"`
 	RayClusterName   string `json:"rayClusterName,omitempty" jsonschema:"the RayCluster backing this job (status.rayClusterName)"`
 	DeploymentStatus string `json:"deploymentStatus" jsonschema:"the CRD lifecycle phase (status.jobDeploymentStatus): Initializing/Running/Complete/Failed/..."`
@@ -54,12 +56,14 @@ type jobLogsInput struct {
 // the honest truncation signal. Scheduled=false means there are no logs yet (the
 // job has not been scheduled to a cluster), NOT an error.
 type JobLogsOutput struct {
-	Name         string `json:"name"`
-	Namespace    string `json:"namespace"`
-	Scheduled    bool   `json:"scheduled" jsonschema:"false means the job is not yet scheduled, so no logs exist yet"`
-	Logs         string `json:"logs" jsonschema:"the bounded log tail (most recent output)"`
-	Truncated    bool   `json:"truncated" jsonschema:"true if the line/byte ceiling clipped earlier output"`
-	BytesOmitted int    `json:"bytesOmitted,omitempty" jsonschema:"a floor on how many bytes of the full buffer were dropped"`
+	Name          string `json:"name"`
+	Namespace     string `json:"namespace"`
+	Scheduled     bool   `json:"scheduled" jsonschema:"false means the job is not yet scheduled, so no logs exist yet"`
+	Degraded      bool   `json:"degraded" jsonschema:"true when the job is scheduled but the Ray dashboard was unreachable, so no logs could be fetched (not an error)"`
+	DegradeReason string `json:"degradeReason,omitempty" jsonschema:"when degraded, the bounded reason the logs were unavailable"`
+	Logs          string `json:"logs" jsonschema:"the bounded log tail (most recent output)"`
+	Truncated     bool   `json:"truncated" jsonschema:"true if the line/byte ceiling clipped earlier output"`
+	BytesOmitted  int    `json:"bytesOmitted,omitempty" jsonschema:"a floor on how many bytes of the full buffer were dropped"`
 }
 
 // addJobTools registers ray_job_get and ray_job_logs against the domain
@@ -125,6 +129,8 @@ func toJobGetOutput(res domain.JobGetResult) JobGetOutput {
 		Name:             d.Name,
 		Namespace:        d.Namespace,
 		Scheduled:        res.Scheduled,
+		Degraded:         res.Degraded,
+		DegradeReason:    res.DegradeReason,
 		JobID:            d.JobID,
 		RayClusterName:   d.RayClusterName,
 		DeploymentStatus: d.JobDeploymentStatus,
@@ -155,9 +161,11 @@ func toJobGetOutput(res domain.JobGetResult) JobGetOutput {
 // scheduling there is no tail, so Logs is empty and Scheduled is false.
 func toJobLogsOutput(res domain.JobLogsResult) JobLogsOutput {
 	out := JobLogsOutput{
-		Name:      res.Detail.Name,
-		Namespace: res.Detail.Namespace,
-		Scheduled: res.Scheduled,
+		Name:          res.Detail.Name,
+		Namespace:     res.Detail.Namespace,
+		Scheduled:     res.Scheduled,
+		Degraded:      res.Degraded,
+		DegradeReason: res.DegradeReason,
 	}
 	if res.Logs != nil {
 		out.Logs = res.Logs.Text
@@ -177,6 +185,15 @@ func jobGetSummary(out JobGetOutput) string {
 			out.Name, out.Namespace, deploymentOrUnknown(out.DeploymentStatus),
 		)
 	}
+	if out.Degraded {
+		// Graceful degrade (spec §3.2/§5): the job is scheduled but the live Ray
+		// dashboard was unreachable, so report the CRD lifecycle and why the live
+		// detail is missing — never a connection error.
+		return fmt.Sprintf(
+			"RayJob %q in namespace %q: %s; live Ray detail unavailable: %s",
+			out.Name, out.Namespace, deploymentOrUnknown(out.DeploymentStatus), out.DegradeReason,
+		)
+	}
 	return fmt.Sprintf(
 		"RayJob %q in namespace %q: %s",
 		out.Name, out.Namespace, out.Health,
@@ -188,6 +205,12 @@ func jobGetSummary(out JobGetOutput) string {
 func jobLogsSummary(out JobLogsOutput) string {
 	if !out.Scheduled {
 		return fmt.Sprintf("RayJob %q in namespace %q has no logs yet (not scheduled)", out.Name, out.Namespace)
+	}
+	if out.Degraded {
+		return fmt.Sprintf(
+			"RayJob %q in namespace %q: logs unavailable — live Ray detail unavailable: %s",
+			out.Name, out.Namespace, out.DegradeReason,
+		)
 	}
 	if out.Truncated {
 		return fmt.Sprintf(

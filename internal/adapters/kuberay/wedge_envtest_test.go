@@ -173,6 +173,81 @@ func TestWedgeNotScheduledNoDial(t *testing.T) {
 	}
 }
 
+// TestWedgeDegradesWhenDashboardUnreachable proves the AC's graceful-degrade path
+// end-to-end against the real apiserver AND the real rayapi client (Task 16b): a
+// SCHEDULED RayJob whose dashboard cannot be dialed returns the CRD-derived view
+// annotated "degraded" with a bounded reason — never a hard failure. The
+// dashboard is a closed httptest server (its URL captured, then shut down), so
+// the real rayapi client gets a genuine connection-refused that the JobService
+// must absorb into Degraded rather than propagate.
+func TestWedgeDegradesWhenDashboardUnreachable(t *testing.T) {
+	adapter, k8s := startAdapter(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const (
+		namespace = "default"
+		name      = "wedge-degraded"
+		jobID     = "raysubmit_degraded1"
+		cluster   = "wedge-degraded-raycluster"
+	)
+
+	// Stand up then immediately close a dashboard so its address is real but
+	// refuses connections — a genuine dial failure for the real rayapi client.
+	dashboard := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dashboard.URL
+	dashboard.Close()
+
+	rj := newRayJob(namespace, name)
+	if err := k8s.Create(ctx, rj); err != nil {
+		t.Fatalf("create RayJob: %v", err)
+	}
+	// Scheduled (jobId + dashboardURL set) → the gate opens and phase 2 dials.
+	rj.Status = rayv1.RayJobStatus{
+		JobId:               jobID,
+		RayClusterName:      cluster,
+		DashboardURL:        "http://" + name + "-head-svc.default.svc:8265",
+		JobStatus:           rayv1.JobStatusRunning,
+		JobDeploymentStatus: rayv1.JobDeploymentStatusRunning,
+	}
+	if err := k8s.Status().Update(ctx, rj); err != nil {
+		t.Fatalf("status subresource update: %v", err)
+	}
+
+	api := rayapi.NewClient(&config.Config{})
+	svc := domain.NewJobService(adapter, fixedEndpoint{baseURL: deadURL}, api, namespace)
+
+	got, err := svc.Get(ctx, domain.JobGetRequest{Name: name})
+	if err != nil {
+		t.Fatalf("JobService.Get returned a hard error for an unreachable dashboard (want graceful degrade): %v", err)
+	}
+	if !got.Scheduled {
+		t.Errorf("Scheduled = false, want true (the job is scheduled; only the live dial failed)")
+	}
+	if !got.Degraded {
+		t.Errorf("Degraded = false, want true")
+	}
+	if got.Live != nil {
+		t.Errorf("Live = %+v, want nil when degraded", got.Live)
+	}
+	if got.DegradeReason == "" {
+		t.Errorf("DegradeReason is empty, want the bounded dial failure cause")
+	}
+	if got.Detail.JobDeploymentStatus != "Running" {
+		t.Errorf("Detail.JobDeploymentStatus = %q, want Running (CRD-derived view preserved)", got.Detail.JobDeploymentStatus)
+	}
+
+	// Logs degrade the same way.
+	logs, err := svc.Logs(ctx, domain.JobLogsRequest{Name: name})
+	if err != nil {
+		t.Fatalf("JobService.Logs hard error for unreachable dashboard: %v", err)
+	}
+	if !logs.Scheduled || !logs.Degraded || logs.Logs != nil {
+		t.Errorf("logs Scheduled=%v Degraded=%v Logs=%v, want true/true/nil", logs.Scheduled, logs.Degraded, logs.Logs)
+	}
+}
+
 // writeJSON writes a dashboard JSON body, failing the test on a write error
 // (errcheck) — the combined harness's analogue of rayapi's writeBody helper.
 func writeJSON(t *testing.T, w http.ResponseWriter, format string, args ...any) {
