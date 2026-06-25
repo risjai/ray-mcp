@@ -362,6 +362,15 @@ clear "job not yet scheduled" status (not a tunnel/connection error). A
 `wait(until=running)` issued immediately after submit spends phase 1 entirely on
 the CRD.
 
+> **Implementation note (Task 16a).** The phase-1 gate is `status.jobId != "" AND
+> status.dashboardURL != ""`, not `jobId` alone. KubeRay v1.6.1 sets `jobId`
+> (and `rayClusterName`) in the **New** state — before the RayCluster exists — and
+> only sets `dashboardURL` once the cluster is **Ready** and the head URL is
+> fetched. Gating on `jobId` alone would open phase 2 against a not-yet-provisioned
+> head and surface a connection error where the honest answer is "not yet
+> scheduled" — the exact failure this section exists to avoid. Do **not** weaken
+> the gate back to `jobId`-only.
+
 **Tunnel lifecycle (Q6):** reachability is resolved via the `RayReachability`
 strategy — `DirectDial` when in-cluster (no tunnel at all), `PortForward` (SPDY)
 when out-of-cluster. Tunnels are **pooled per (namespace, cluster) with an

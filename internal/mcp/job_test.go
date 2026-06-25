@@ -1,0 +1,305 @@
+package mcp_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/risjai/ray-mcp/internal/config"
+	"github.com/risjai/ray-mcp/internal/domain"
+	mcpserver "github.com/risjai/ray-mcp/internal/mcp"
+)
+
+// fakeJobReader implements domain.JobReader for the MCP-layer job tests. Tests
+// seed jobs keyed by namespace/name directly.
+type fakeJobReader struct {
+	jobs map[string]domain.JobDetail
+}
+
+func (f *fakeJobReader) GetJob(_ context.Context, namespace, name string) (domain.JobDetail, error) {
+	j, ok := f.jobs[namespace+"/"+name]
+	if !ok {
+		return domain.JobDetail{}, &domain.NotFoundError{Kind: domain.KindRayJob, Namespace: namespace, Name: name}
+	}
+	return j, nil
+}
+
+// fakeReach returns a canned endpoint for any cluster.
+type fakeReach struct{ endpoint domain.Endpoint }
+
+func (f fakeReach) Endpoint(_ context.Context, _, _ string, _ int) (domain.Endpoint, error) {
+	return f.endpoint, nil
+}
+
+// fakeRayAPI returns canned live status / logs keyed by submission id.
+type fakeRayAPI struct {
+	status map[string]domain.RayJobStatus
+	logs   map[string]domain.RayJobLogs
+}
+
+func (f fakeRayAPI) JobStatus(_ context.Context, _ domain.Endpoint, jobID string) (domain.RayJobStatus, error) {
+	return f.status[jobID], nil
+}
+
+func (f fakeRayAPI) JobLogs(_ context.Context, _ domain.Endpoint, jobID string, _ domain.LogOptions) (domain.RayJobLogs, error) {
+	return f.logs[jobID], nil
+}
+
+// connectJobs wires a server whose wedge backend is the given collaborators and
+// returns an in-memory client session.
+func connectJobs(t *testing.T, cfg *config.Config, wedge mcpserver.WedgeBackend) *mcp.ClientSession {
+	t.Helper()
+	ctx := context.Background()
+
+	server := mcpserver.NewServer(cfg,
+		fakeSource{contextName: "ctx", defaultNamespace: cfg.DefaultNamespace},
+		&fakeKubeRay{}, &fakeKubeRay{}, wedge, domain.NopAuditSink{})
+	serverT, clientT := mcp.NewInMemoryTransports()
+	if _, err := server.Connect(ctx, serverT, nil); err != nil {
+		t.Fatalf("server.Connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v0"}, nil)
+	session, err := client.Connect(ctx, clientT, nil)
+	if err != nil {
+		t.Fatalf("client.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	return session
+}
+
+// scheduledJobDetail is a JobDetail past the dial gate (jobId + dashboardURL set).
+func scheduledJobDetail(namespace, name string) domain.JobDetail {
+	return domain.JobDetail{
+		JobSummary: domain.JobSummary{
+			Name: name, Namespace: namespace, JobStatus: "RUNNING", Health: "Running; job RUNNING",
+		},
+		JobID:               "raysubmit_xyz",
+		DashboardURL:        "http://" + name + "-head.svc:8265",
+		JobDeploymentStatus: "Running",
+		RayClusterName:      name + "-cluster",
+	}
+}
+
+func wedgeFor(jobs map[string]domain.JobDetail, api fakeRayAPI) mcpserver.WedgeBackend {
+	return mcpserver.WedgeBackend{
+		Jobs:  &fakeJobReader{jobs: jobs},
+		Reach: fakeReach{endpoint: domain.Endpoint{BaseURL: "http://127.0.0.1:30000"}},
+		API:   api,
+	}
+}
+
+// TestListToolsShowsJobToolsWithReadOnlyHint asserts both job tools are
+// registered and annotated read-only when a wedge backend is wired.
+func TestListToolsShowsJobToolsWithReadOnlyHint(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "default"}
+	session := connectJobs(t, cfg, wedgeFor(map[string]domain.JobDetail{}, fakeRayAPI{}))
+
+	res, err := session.ListTools(context.Background(), &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	byName := map[string]*mcp.Tool{}
+	for _, tool := range res.Tools {
+		byName[tool.Name] = tool
+	}
+	for _, name := range []string{"ray_job_get", "ray_job_logs"} {
+		tool, ok := byName[name]
+		if !ok {
+			t.Fatalf("%s not registered; got %v", name, res.Tools)
+		}
+		if tool.Annotations == nil || !tool.Annotations.ReadOnlyHint {
+			t.Errorf("%s missing readOnlyHint annotation: %+v", name, tool.Annotations)
+		}
+	}
+}
+
+// TestJobToolsAbsentWithoutWedge asserts the job tools are NOT registered when no
+// wedge backend is wired (zero WedgeBackend) — the gate that lets cluster-only
+// servers omit them.
+func TestJobToolsAbsentWithoutWedge(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "default"}
+	session := connectJobs(t, cfg, mcpserver.WedgeBackend{})
+
+	res, err := session.ListTools(context.Background(), &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Name == "ray_job_get" || tool.Name == "ray_job_logs" {
+			t.Errorf("%s registered without a wedge backend", tool.Name)
+		}
+	}
+}
+
+// TestJobGetScheduledFusesLiveStatus asserts ray_job_get on a scheduled job
+// returns the live dashboard status fused with the CRD identity.
+func TestJobGetScheduledFusesLiveStatus(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	jobs := map[string]domain.JobDetail{"demo/trainer": scheduledJobDetail("demo", "trainer")}
+	api := fakeRayAPI{status: map[string]domain.RayJobStatus{
+		"raysubmit_xyz": {JobID: "raysubmit_xyz", Status: "SUCCEEDED", Message: "done"},
+	}}
+	session := connectJobs(t, cfg, wedgeFor(jobs, api))
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_job_get",
+		Arguments: map[string]any{"name": "trainer"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool reported error: %+v", res)
+	}
+	sc := res.StructuredContent.(map[string]any)
+	if sc["scheduled"] != true {
+		t.Errorf("scheduled = %v, want true", sc["scheduled"])
+	}
+	if sc["jobStatus"] != "SUCCEEDED" {
+		t.Errorf("jobStatus = %v, want SUCCEEDED (live dashboard status)", sc["jobStatus"])
+	}
+	if sc["jobId"] != "raysubmit_xyz" {
+		t.Errorf("jobId = %v, want raysubmit_xyz", sc["jobId"])
+	}
+	if _, present := sc["raw"]; present {
+		t.Errorf("raw present in distilled get: %v", sc["raw"])
+	}
+	if textContent(res) == "" {
+		t.Error("no text summary in result content")
+	}
+}
+
+// TestJobGetNotScheduledReportsClean asserts a not-yet-scheduled job returns a
+// clean scheduled=false result (the AC: not a tunnel/connection error).
+func TestJobGetNotScheduledReportsClean(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	jobs := map[string]domain.JobDetail{"demo/pending": {
+		JobSummary:          domain.JobSummary{Name: "pending", Namespace: "demo"},
+		JobDeploymentStatus: "Initializing",
+	}}
+	// nil-ish API: the dashboard must NOT be dialed for a not-scheduled job.
+	session := connectJobs(t, cfg, wedgeFor(jobs, fakeRayAPI{}))
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_job_get",
+		Arguments: map[string]any{"name": "pending"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool reported error for a not-scheduled job (want clean result): %+v", res)
+	}
+	sc := res.StructuredContent.(map[string]any)
+	if sc["scheduled"] != false {
+		t.Errorf("scheduled = %v, want false", sc["scheduled"])
+	}
+	if sc["deploymentStatus"] != "Initializing" {
+		t.Errorf("deploymentStatus = %v, want Initializing", sc["deploymentStatus"])
+	}
+}
+
+// TestJobGetMissingNameErrors asserts an empty name is a validation error.
+func TestJobGetMissingNameErrors(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	session := connectJobs(t, cfg, wedgeFor(map[string]domain.JobDetail{}, fakeRayAPI{}))
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_job_get",
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("CallTool transport error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("empty name did not produce a tool error: %+v", res)
+	}
+}
+
+// TestJobGetNotFoundMapsCleanError asserts a missing job surfaces a clean,
+// bounded NotFound tool error.
+func TestJobGetNotFoundMapsCleanError(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	session := connectJobs(t, cfg, wedgeFor(map[string]domain.JobDetail{}, fakeRayAPI{}))
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_job_get",
+		Arguments: map[string]any{"name": "ghost"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool transport error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("missing job did not produce a tool error: %+v", res)
+	}
+}
+
+// TestJobLogsScheduledReturnsTail asserts ray_job_logs returns the bounded tail
+// and truncation signal for a scheduled job.
+func TestJobLogsScheduledReturnsTail(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	jobs := map[string]domain.JobDetail{"demo/trainer": scheduledJobDetail("demo", "trainer")}
+	api := fakeRayAPI{logs: map[string]domain.RayJobLogs{
+		"raysubmit_xyz": {Text: "the tail", Truncated: true, BytesOmitted: 2048},
+	}}
+	session := connectJobs(t, cfg, wedgeFor(jobs, api))
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_job_logs",
+		Arguments: map[string]any{"name": "trainer", "tailLines": 50},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool reported error: %+v", res)
+	}
+	sc := res.StructuredContent.(map[string]any)
+	if sc["scheduled"] != true {
+		t.Errorf("scheduled = %v, want true", sc["scheduled"])
+	}
+	if sc["logs"] != "the tail" {
+		t.Errorf("logs = %v, want 'the tail'", sc["logs"])
+	}
+	if sc["truncated"] != true {
+		t.Errorf("truncated = %v, want true", sc["truncated"])
+	}
+}
+
+// TestJobLogsNotScheduledNoLogs asserts logs on a not-yet-scheduled job report
+// scheduled=false with no logs (not an error).
+func TestJobLogsNotScheduledNoLogs(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	jobs := map[string]domain.JobDetail{"demo/pending": {
+		JobSummary:          domain.JobSummary{Name: "pending", Namespace: "demo"},
+		JobDeploymentStatus: "Initializing",
+	}}
+	session := connectJobs(t, cfg, wedgeFor(jobs, fakeRayAPI{}))
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_job_logs",
+		Arguments: map[string]any{"name": "pending"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool reported error for not-scheduled logs: %+v", res)
+	}
+	sc := res.StructuredContent.(map[string]any)
+	if sc["scheduled"] != false {
+		t.Errorf("scheduled = %v, want false", sc["scheduled"])
+	}
+	if sc["logs"] != "" {
+		t.Errorf("logs = %v, want empty", sc["logs"])
+	}
+}

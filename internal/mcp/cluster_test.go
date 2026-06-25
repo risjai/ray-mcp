@@ -75,7 +75,7 @@ func connectCluster(t *testing.T, cfg *config.Config, kube domain.ClusterReader)
 
 	// Read-path tests run with mutations off, so the write backend is never
 	// invoked; a bare fake + nop audit satisfy NewServer's signature.
-	server := mcpserver.NewServer(cfg, fakeSource{contextName: "ctx", defaultNamespace: cfg.DefaultNamespace}, kube, &fakeKubeRay{}, domain.NopAuditSink{})
+	server := mcpserver.NewServer(cfg, fakeSource{contextName: "ctx", defaultNamespace: cfg.DefaultNamespace}, kube, &fakeKubeRay{}, mcpserver.WedgeBackend{}, domain.NopAuditSink{})
 	serverT, clientT := mcp.NewInMemoryTransports()
 
 	if _, err := server.Connect(ctx, serverT, nil); err != nil {

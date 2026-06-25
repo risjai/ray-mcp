@@ -9,9 +9,11 @@ Read-only today; a guarded write path is on the way (see below).
 ![Status](https://img.shields.io/badge/status-v0.1.0%20preview-orange)
 
 > **Status: v0.1.0 preview.** Today: `ray_capabilities`, the RayCluster read tools
-> (`ray_cluster_list` / `ray_cluster_get` / `ray_cluster_events`), and the full
-> guarded RayCluster write path (`create` / `update` / `scale` / `delete`), over
-> stdio. The wedge (Ray dashboard/job API) and Ray job/service tools land next.
+> (`ray_cluster_list` / `ray_cluster_get` / `ray_cluster_events`), the full
+> guarded RayCluster write path (`create` / `update` / `scale` / `delete`), and the
+> read-only RayJob wedge (`ray_job_get` / `ray_job_logs` — CRD status fused with
+> the live Ray dashboard/job API), over stdio. The remaining Ray job/service tools
+> land next.
 
 ## Why ray-mcp
 
@@ -134,8 +136,9 @@ Needs Docker + kubectl + Go + Claude Code; ~20–30 min; fully disposable.
 | RayCluster create — `ray_cluster_create` (unified apply pipeline, SSA, dry-run, diffs) | ✅ Shipped (`--allow-mutations`) |
 | RayCluster writes — update / scale (SSA, dry-run, diffs, autoscaler-safe) | ✅ Shipped (`--allow-mutations`) |
 | RayCluster delete — `ray_cluster_delete` (destructive tier, two-step confirm-fingerprint, `protected` guard) | ✅ Shipped (`--allow-destructive`) |
-| The wedge — read-only Ray dashboard/job API reach (live status) | 📋 Planned |
-| RayJob tools — submit / get / logs / wait / list / delete | 📋 Planned |
+| The wedge — read-only Ray dashboard/job API reach (live status) | ✅ Shipped |
+| RayJob read — `ray_job_get` / `ray_job_logs` (two-phase wedge: CRD + live dashboard) | ✅ Shipped |
+| RayJob tools — submit / wait / list / delete | 📋 Planned |
 | RayService tools — deploy / update / list / get / delete | 📋 Planned |
 | Streamable HTTP transport + auth (static bearer / TokenReview) | 📋 Planned |
 | Read-only RBAC floor — ServiceAccount + ClusterRole ([`deploy/rbac/`](deploy/rbac/)) | ✅ Shipped (read-only) |

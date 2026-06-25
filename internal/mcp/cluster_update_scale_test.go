@@ -81,7 +81,7 @@ func (b *liveBackend) GetCluster(_ context.Context, namespace, name string) (dom
 func connectLive(t *testing.T, cfg *config.Config, backend *liveBackend) *mcp.ClientSession {
 	t.Helper()
 	ctx := context.Background()
-	server := mcpserver.NewServer(cfg, fakeSource{contextName: "ctx", defaultNamespace: cfg.DefaultNamespace}, backend, backend, domain.NopAuditSink{})
+	server := mcpserver.NewServer(cfg, fakeSource{contextName: "ctx", defaultNamespace: cfg.DefaultNamespace}, backend, backend, mcpserver.WedgeBackend{}, domain.NopAuditSink{})
 	serverT, clientT := mcp.NewInMemoryTransports()
 	if _, err := server.Connect(ctx, serverT, nil); err != nil {
 		t.Fatalf("server.Connect: %v", err)

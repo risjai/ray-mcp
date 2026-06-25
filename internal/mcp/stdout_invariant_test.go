@@ -46,7 +46,7 @@ func TestStdoutStaysClean(t *testing.T) {
 
 	// Audit bound to io.Discard: the stdio invariant is that audit goes anywhere
 	// EXCEPT stdout; this proves the server emits nothing to stdout regardless.
-	server := mcpserver.NewServer(cfg, stdoutFakeSource{}, &fakeKubeRay{}, &fakeKubeRay{}, observability.NewAuditLogger(io.Discard))
+	server := mcpserver.NewServer(cfg, stdoutFakeSource{}, &fakeKubeRay{}, &fakeKubeRay{}, mcpserver.WedgeBackend{}, observability.NewAuditLogger(io.Discard))
 	serverT, clientT := mcp.NewInMemoryTransports()
 	if _, err := server.Connect(ctx, serverT, nil); err != nil {
 		t.Fatalf("server.Connect: %v", err)
