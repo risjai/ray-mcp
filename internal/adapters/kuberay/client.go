@@ -7,6 +7,7 @@ import (
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -37,8 +38,9 @@ type Client struct {
 	contextName      string
 	defaultNamespace string
 
-	mu  sync.Mutex
-	k8s client.Client
+	mu         sync.Mutex
+	k8s        client.Client
+	restConfig *rest.Config // the config k8s was built from; nil until ensureClient resolves it (or for an injected envtest client).
 }
 
 // NewClient builds the production adapter WITHOUT touching the network. It stores
@@ -126,6 +128,7 @@ func (c *Client) ensureClient() (client.Client, error) {
 	}
 
 	c.k8s = k8s
+	c.restConfig = restConfig
 	return k8s, nil
 }
 
@@ -159,6 +162,26 @@ func newScheme() (*runtime.Scheme, error) {
 		return nil, err //nolint:wrapcheck // trivial scheme-registration failure; the caller has full context.
 	}
 	return scheme, nil
+}
+
+// RuntimeClient resolves and returns the uncached controller-runtime client plus
+// the *rest.Config it was built from, for collaborators that need a live cluster
+// connection sharing this adapter's kubeconfig resolution — specifically the
+// reachability resolver (which needs the client for head-pod/service lookups) and
+// the SPDY port-forward dialer (which needs the rest.Config). It piggybacks on
+// the same lazy build as the CRD path: a successful resolution is cached, a
+// failure is not. main.go calls it once at startup, NON-fatally — when no
+// kubeconfig resolves it wires a degraded reachability path rather than aborting,
+// preserving the offline-boot invariant (ray_capabilities works with no cluster).
+func (c *Client) RuntimeClient() (client.Client, *rest.Config, error) {
+	k8s, err := c.ensureClient()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return k8s, c.restConfig, nil
 }
 
 // ContextName returns the bound kubeconfig context name, or a placeholder when

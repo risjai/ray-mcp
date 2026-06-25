@@ -104,7 +104,7 @@ func connectWrite(t *testing.T, cfg *config.Config, backend *fakeWriteBackend) *
 	t.Helper()
 	ctx := context.Background()
 
-	server := mcpserver.NewServer(cfg, fakeSource{contextName: "ctx", defaultNamespace: cfg.DefaultNamespace}, &fakeKubeRay{}, backend, domain.NopAuditSink{})
+	server := mcpserver.NewServer(cfg, fakeSource{contextName: "ctx", defaultNamespace: cfg.DefaultNamespace}, &fakeKubeRay{}, backend, mcpserver.WedgeBackend{}, domain.NopAuditSink{})
 	serverT, clientT := mcp.NewInMemoryTransports()
 	if _, err := server.Connect(ctx, serverT, nil); err != nil {
 		t.Fatalf("server.Connect: %v", err)

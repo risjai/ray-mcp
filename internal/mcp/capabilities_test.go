@@ -31,7 +31,7 @@ func connect(t *testing.T, cfg *config.Config, src fakeSource) *mcp.ClientSessio
 	t.Helper()
 	ctx := context.Background()
 
-	server := mcpserver.NewServer(cfg, src, &fakeKubeRay{}, &fakeKubeRay{}, domain.NopAuditSink{})
+	server := mcpserver.NewServer(cfg, src, &fakeKubeRay{}, &fakeKubeRay{}, mcpserver.WedgeBackend{}, domain.NopAuditSink{})
 	serverT, clientT := mcp.NewInMemoryTransports()
 
 	if _, err := server.Connect(ctx, serverT, nil); err != nil {

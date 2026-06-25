@@ -21,6 +21,20 @@ type ClusterWriteBackend interface {
 	domain.Deleter
 }
 
+// WedgeBackend bundles the three collaborators the RayJob read tools (the
+// cross-plane "wedge", spec §5/§7.B) need: the phase-1 CRD reader (Jobs), the
+// head-endpoint resolver (Reach), and the read-only Ray dashboard client (API).
+// Unlike ClusterWriteBackend these are three DIFFERENT adapters, so the bundle is
+// a struct, not one interface. The wedge tools register only when Jobs is
+// non-nil, so a cluster-only server (or a test that does not exercise the wedge)
+// simply leaves it zero — matching the "tools are advertised only when wired"
+// convention (spec §6).
+type WedgeBackend struct {
+	Jobs  domain.JobReader
+	Reach domain.RayReachability
+	API   domain.RayAPIPort
+}
+
 // NewServer constructs the MCP server and registers the tools available for the
 // given config. The read-only ray_capabilities meta tool reports cluster binding
 // from src (config-only, no cluster call); the RayCluster read tools
@@ -31,7 +45,7 @@ type ClusterWriteBackend interface {
 // mutation via audit. All collaborators are narrow interfaces so tests can inject
 // fakes. It returns the underlying *mcp.Server so the caller can run it over any
 // transport (stdio in main, in-memory in tests).
-func NewServer(cfg *config.Config, src capabilitiesSource, kube domain.ClusterReader, write ClusterWriteBackend, audit domain.AuditSink) *mcp.Server {
+func NewServer(cfg *config.Config, src capabilitiesSource, kube domain.ClusterReader, write ClusterWriteBackend, wedge WedgeBackend, audit domain.AuditSink) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "ray-mcp",
 		Version: version.Version,
@@ -39,6 +53,12 @@ func NewServer(cfg *config.Config, src capabilitiesSource, kube domain.ClusterRe
 
 	addCapabilitiesTool(server, cfg, src)
 	addClusterTools(server, domain.NewClusterService(kube, cfg.DefaultNamespace))
+
+	// The RayJob read tools (the wedge) register only when their backend is wired.
+	// main.go always wires it; a bare server (or a cluster-only test) leaves it zero.
+	if wedge.Jobs != nil {
+		addJobTools(server, domain.NewJobService(wedge.Jobs, wedge.Reach, wedge.API, cfg.DefaultNamespace))
+	}
 
 	if cfg.AllowMutations {
 		applySvc := domain.NewApplyService(write, audit)

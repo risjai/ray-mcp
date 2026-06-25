@@ -29,7 +29,7 @@ func TestCapabilitiesWorksOffline(t *testing.T) {
 	}
 	adapter := kuberay.NewClient(cfg)
 
-	server := mcpserver.NewServer(cfg, adapter, adapter, adapter, observability.NewAuditLogger(io.Discard))
+	server := mcpserver.NewServer(cfg, adapter, adapter, adapter, mcpserver.WedgeBackend{}, observability.NewAuditLogger(io.Discard))
 	serverT, clientT := mcp.NewInMemoryTransports()
 	if _, err := server.Connect(ctx, serverT, nil); err != nil {
 		t.Fatalf("server.Connect: %v", err)

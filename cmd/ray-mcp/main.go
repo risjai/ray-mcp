@@ -19,6 +19,8 @@ import (
 	"syscall"
 
 	"github.com/risjai/ray-mcp/internal/adapters/kuberay"
+	"github.com/risjai/ray-mcp/internal/adapters/rayapi"
+	"github.com/risjai/ray-mcp/internal/adapters/reachability"
 	"github.com/risjai/ray-mcp/internal/config"
 	mcpserver "github.com/risjai/ray-mcp/internal/mcp"
 	"github.com/risjai/ray-mcp/internal/observability"
@@ -56,7 +58,16 @@ func run() int {
 	// are disabled — NewServer only registers the audited write tools under
 	// --allow-mutations, so an unmutated server simply never emits a record.
 	audit := observability.NewAuditLogger(os.Stderr)
-	server := mcpserver.NewServer(cfg, adapter, adapter, adapter, audit)
+
+	// Wire the cross-plane "wedge" backend (RayJob read tools). The reachability
+	// resolver and SPDY dialer need a live cluster connection, so they reuse the
+	// kuberay adapter's kubeconfig resolution. This is best-effort and NON-fatal:
+	// if no kubeconfig resolves (e.g. no cluster bound), the wedge tools are still
+	// advertised but return a clean unreachable error at call time — the server
+	// boots and ray_capabilities works regardless (the lazy-dial boot invariant).
+	wedge := buildWedge(cfg, adapter, logger)
+
+	server := mcpserver.NewServer(cfg, adapter, adapter, adapter, wedge, audit)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -67,6 +78,35 @@ func run() int {
 		return 1
 	}
 	return 0
+}
+
+// buildWedge assembles the cross-plane "wedge" backend for the RayJob read tools
+// (ray_job_get / ray_job_logs): the phase-1 CRD reader (the kuberay adapter), the
+// head-endpoint resolver, and the read-only Ray dashboard client.
+//
+// The resolver and SPDY dialer need a live cluster connection, so they reuse the
+// kuberay adapter's kubeconfig resolution via RuntimeClient. That resolution is
+// best-effort here and NON-fatal: when it fails (no kubeconfig / no cluster
+// bound), the wedge still registers but with a degraded resolver that reports the
+// dashboard unreachable — preserving the lazy-dial boot invariant (the server
+// boots and ray_capabilities answers with no cluster). Jobs is always the
+// adapter, so the phase-1 CRD read surfaces its own clean error if the cluster is
+// unreachable; only phase 2 (the dashboard dial) is degraded.
+func buildWedge(cfg *config.Config, adapter *kuberay.Client, logger *slog.Logger) mcpserver.WedgeBackend {
+	api := rayapi.NewClient(cfg)
+
+	k8s, restConfig, err := adapter.RuntimeClient()
+	if err != nil {
+		logger.Warn("wedge reachability degraded: no live cluster connection; ray_job_* live status will report the dashboard unreachable until a cluster is bound", "err", err)
+		return mcpserver.WedgeBackend{
+			Jobs:  adapter,
+			Reach: reachability.NewUnavailable(fmt.Sprintf("no cluster connection: %v", err)),
+			API:   api,
+		}
+	}
+
+	resolver := reachability.NewResolver(cfg, k8s, reachability.NewSPDYDialer(restConfig))
+	return mcpserver.WedgeBackend{Jobs: adapter, Reach: resolver, API: api}
 }
 
 // logLevel maps the validated config log level to an slog level.
