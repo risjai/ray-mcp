@@ -2,6 +2,7 @@ package mcp_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -271,6 +272,91 @@ func TestJobLogsScheduledReturnsTail(t *testing.T) {
 	}
 	if sc["truncated"] != true {
 		t.Errorf("truncated = %v, want true", sc["truncated"])
+	}
+}
+
+// unreachableReach fails endpoint resolution with a typed unreachable error —
+// the seam for the graceful-degrade MCP tests (Task 16b).
+type unreachableReach struct{ reason string }
+
+func (u unreachableReach) Endpoint(_ context.Context, namespace, cluster string, _ int) (domain.Endpoint, error) {
+	return domain.Endpoint{}, &domain.RayAPIUnreachableError{Endpoint: namespace + "/" + cluster, Reason: u.reason}
+}
+
+// degradedWedge wires a scheduled job whose dashboard is unreachable.
+func degradedWedge(jobs map[string]domain.JobDetail, reason string) mcpserver.WedgeBackend {
+	return mcpserver.WedgeBackend{
+		Jobs:  &fakeJobReader{jobs: jobs},
+		Reach: unreachableReach{reason: reason},
+		API:   fakeRayAPI{},
+	}
+}
+
+// TestJobGetDegradesGracefullyWhenDashboardUnreachable asserts the AC's degrade
+// path at the tool edge: a scheduled job whose dashboard is unreachable returns a
+// clean (non-error) result with scheduled=true, degraded=true, the bounded
+// reason, and the CRD-derived lifecycle — never a tool error.
+func TestJobGetDegradesGracefullyWhenDashboardUnreachable(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	jobs := map[string]domain.JobDetail{"demo/trainer": scheduledJobDetail("demo", "trainer")}
+	session := connectJobs(t, cfg, degradedWedge(jobs, "connection refused"))
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_job_get",
+		Arguments: map[string]any{"name": "trainer"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool reported a hard error for an unreachable dashboard (want graceful degrade): %+v", res)
+	}
+	sc := res.StructuredContent.(map[string]any)
+	if sc["scheduled"] != true {
+		t.Errorf("scheduled = %v, want true (the job is scheduled; only the live dial failed)", sc["scheduled"])
+	}
+	if sc["degraded"] != true {
+		t.Errorf("degraded = %v, want true", sc["degraded"])
+	}
+	if sc["deploymentStatus"] != "Running" {
+		t.Errorf("deploymentStatus = %v, want Running (CRD-derived view preserved)", sc["deploymentStatus"])
+	}
+	if reason, _ := sc["degradeReason"].(string); reason != "connection refused" {
+		t.Errorf("degradeReason = %v, want 'connection refused'", sc["degradeReason"])
+	}
+	if txt := textContent(res); !strings.Contains(txt, "live Ray detail unavailable") || !strings.Contains(txt, "connection refused") {
+		t.Errorf("summary = %q, want the 'live Ray detail unavailable: connection refused' degrade line", txt)
+	}
+}
+
+// TestJobLogsDegradesGracefullyWhenDashboardUnreachable asserts logs degrade the
+// same way: scheduled=true, degraded=true, no logs, clean (non-error) result.
+func TestJobLogsDegradesGracefullyWhenDashboardUnreachable(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	jobs := map[string]domain.JobDetail{"demo/trainer": scheduledJobDetail("demo", "trainer")}
+	session := connectJobs(t, cfg, degradedWedge(jobs, "connection refused"))
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_job_logs",
+		Arguments: map[string]any{"name": "trainer"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool reported a hard error for unreachable logs (want graceful degrade): %+v", res)
+	}
+	sc := res.StructuredContent.(map[string]any)
+	if sc["scheduled"] != true || sc["degraded"] != true {
+		t.Errorf("scheduled=%v degraded=%v, want true/true", sc["scheduled"], sc["degraded"])
+	}
+	if sc["logs"] != "" {
+		t.Errorf("logs = %v, want empty when degraded", sc["logs"])
+	}
+	if txt := textContent(res); !strings.Contains(txt, "live Ray detail unavailable") {
+		t.Errorf("summary = %q, want the degrade line", txt)
 	}
 }
 

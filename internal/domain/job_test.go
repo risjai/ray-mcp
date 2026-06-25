@@ -185,6 +185,149 @@ func TestJobGetNotFoundPropagates(t *testing.T) {
 	}
 }
 
+// erroringReachability fails every resolution with a fixed error — the seam for
+// the graceful-degrade tests (Task 16b): a scheduled job whose head endpoint
+// cannot be resolved.
+type erroringReachability struct{ err error }
+
+func (e erroringReachability) Endpoint(_ context.Context, _, _ string, _ int) (Endpoint, error) {
+	return Endpoint{}, e.err
+}
+
+// erroringRayAPI resolves the endpoint fine but fails the dashboard dial — the
+// seam for a reachable head whose dashboard is down (Task 16b degrade).
+type erroringRayAPI struct{ err error }
+
+func (e erroringRayAPI) JobStatus(_ context.Context, _ Endpoint, _ string) (RayJobStatus, error) {
+	return RayJobStatus{}, e.err
+}
+
+func (e erroringRayAPI) JobLogs(_ context.Context, _ Endpoint, _ string, _ LogOptions) (RayJobLogs, error) {
+	return RayJobLogs{}, e.err
+}
+
+// TestJobGetDegradesWhenEndpointUnreachable asserts a scheduled job whose head
+// endpoint cannot be resolved degrades gracefully (spec §3.2/§5): Scheduled
+// stays true, Live is nil, Degraded is set with the bounded reason, and NO error
+// is returned — the agent gets the CRD-derived view, not a connection error.
+func TestJobGetDegradesWhenEndpointUnreachable(t *testing.T) {
+	t.Parallel()
+
+	job := scheduledJob("default", "demo")
+	kube := newJobFake(job)
+	reach := erroringReachability{err: &RayAPIUnreachableError{Endpoint: "default/demo-cluster", Reason: "connection refused"}}
+	svc := NewJobService(kube, reach, nil, "default") // nil api: the dial must never be reached.
+
+	res, err := svc.Get(context.Background(), JobGetRequest{Name: "demo"})
+	if err != nil {
+		t.Fatalf("Get degraded path returned a hard error: %v", err)
+	}
+	if !res.Scheduled {
+		t.Errorf("Scheduled = false, want true (the job IS scheduled; only the live dial failed)")
+	}
+	if !res.Degraded {
+		t.Errorf("Degraded = false, want true")
+	}
+	if res.Live != nil {
+		t.Errorf("Live = %+v, want nil (no live status when degraded)", res.Live)
+	}
+	if res.DegradeReason != "connection refused" {
+		t.Errorf("DegradeReason = %q, want %q", res.DegradeReason, "connection refused")
+	}
+	if res.Detail.JobDeploymentStatus != "Running" {
+		t.Errorf("Detail.JobDeploymentStatus = %q, want Running (CRD-derived view preserved)", res.Detail.JobDeploymentStatus)
+	}
+}
+
+// TestJobGetDegradesWhenDashboardDown asserts the degrade also covers a reachable
+// head whose dashboard dial fails (the endpoint resolves, the HTTP call does not).
+func TestJobGetDegradesWhenDashboardDown(t *testing.T) {
+	t.Parallel()
+
+	job := scheduledJob("default", "demo")
+	kube := newJobFake(job)
+	reach := &fakeReachability{endpoint: Endpoint{BaseURL: "http://127.0.0.1:1"}}
+	api := erroringRayAPI{err: &RayAPIUnreachableError{Endpoint: "http://127.0.0.1:1", Reason: "dashboard returned HTTP 503"}}
+	svc := NewJobService(kube, reach, api, "default")
+
+	res, err := svc.Get(context.Background(), JobGetRequest{Name: "demo"})
+	if err != nil {
+		t.Fatalf("Get degraded path returned a hard error: %v", err)
+	}
+	if !res.Scheduled || !res.Degraded || res.Live != nil {
+		t.Fatalf("got Scheduled=%v Degraded=%v Live=%v, want true/true/nil", res.Scheduled, res.Degraded, res.Live)
+	}
+	if res.DegradeReason != "dashboard returned HTTP 503" {
+		t.Errorf("DegradeReason = %q, want %q", res.DegradeReason, "dashboard returned HTTP 503")
+	}
+}
+
+// TestJobGetDegradesOnTimeout asserts a dial timeout also degrades (a timed-out
+// dial is morally unreachable — "never a hard failure", spec §10).
+func TestJobGetDegradesOnTimeout(t *testing.T) {
+	t.Parallel()
+
+	job := scheduledJob("default", "demo")
+	kube := newJobFake(job)
+	reach := &fakeReachability{endpoint: Endpoint{BaseURL: "http://127.0.0.1:1"}}
+	api := erroringRayAPI{err: &TimeoutError{Op: "JobStatus"}}
+	svc := NewJobService(kube, reach, api, "default")
+
+	res, err := svc.Get(context.Background(), JobGetRequest{Name: "demo"})
+	if err != nil {
+		t.Fatalf("Get on timeout returned a hard error: %v", err)
+	}
+	if !res.Degraded || res.DegradeReason == "" {
+		t.Errorf("got Degraded=%v DegradeReason=%q, want degraded with a reason", res.Degraded, res.DegradeReason)
+	}
+}
+
+// TestJobGetPropagatesDashboardNotFound asserts a dashboard 404 (reachable, but
+// the submission id is unknown) is NOT a degrade — it propagates as NotFound so
+// the agent learns the dashboard does not know the job. Degrade is for
+// unreachability, not for a reachable "no such job".
+func TestJobGetPropagatesDashboardNotFound(t *testing.T) {
+	t.Parallel()
+
+	job := scheduledJob("default", "demo")
+	kube := newJobFake(job)
+	reach := &fakeReachability{endpoint: Endpoint{BaseURL: "http://127.0.0.1:1"}}
+	api := erroringRayAPI{err: &NotFoundError{Kind: KindRayJob, Name: "raysubmit_abc123"}}
+	svc := NewJobService(kube, reach, api, "default")
+
+	_, err := svc.Get(context.Background(), JobGetRequest{Name: "demo"})
+	var nf *NotFoundError
+	if !errors.As(err, &nf) {
+		t.Fatalf("error = %T (%v), want *NotFoundError to propagate (not degrade)", err, err)
+	}
+}
+
+// TestJobLogsDegradesWhenDashboardUnreachable asserts logs degrade the same way:
+// a scheduled job whose dashboard is unreachable reports Scheduled=true,
+// Degraded with reason, no logs, no hard error.
+func TestJobLogsDegradesWhenDashboardUnreachable(t *testing.T) {
+	t.Parallel()
+
+	job := scheduledJob("default", "demo")
+	kube := newJobFake(job)
+	reach := erroringReachability{err: &RayAPIUnreachableError{Endpoint: "default/demo-cluster", Reason: "connection refused"}}
+	svc := NewJobService(kube, reach, nil, "default")
+
+	res, err := svc.Logs(context.Background(), JobLogsRequest{Name: "demo"})
+	if err != nil {
+		t.Fatalf("Logs degraded path returned a hard error: %v", err)
+	}
+	if !res.Scheduled || !res.Degraded {
+		t.Errorf("got Scheduled=%v Degraded=%v, want true/true", res.Scheduled, res.Degraded)
+	}
+	if res.Logs != nil {
+		t.Errorf("Logs = %+v, want nil when degraded", res.Logs)
+	}
+	if res.DegradeReason != "connection refused" {
+		t.Errorf("DegradeReason = %q, want %q", res.DegradeReason, "connection refused")
+	}
+}
+
 // TestJobGetVerboseGate asserts Raw is stripped by default and carried only when
 // Verbose is requested (spec §10 distilled-by-default), mirroring ClusterService.
 func TestJobGetVerboseGate(t *testing.T) {

@@ -1,6 +1,9 @@
 package domain
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // dashboardPort is the Ray head dashboard / Job Submission REST API port. The
 // reachability resolver maps the cluster's head to a usable endpoint on this
@@ -58,9 +61,15 @@ type JobGetRequest struct {
 // running job whose dashboard answered. Raw on Detail is stripped unless Verbose.
 type JobGetResult struct {
 	Detail    JobDetail
-	Scheduled bool          // true iff phase 2 ran (status.jobId + dashboardURL both set).
-	Live      *RayJobStatus // the dialed dashboard status; nil when not scheduled.
-	Verbose   bool
+	Scheduled bool          // true iff the job is past the dial gate (status.jobId + dashboardURL both set).
+	Live      *RayJobStatus // the dialed dashboard status; nil when not scheduled OR when degraded.
+	// Degraded is true when the job IS scheduled but phase 2 could not reach the
+	// dashboard (endpoint unresolvable or dial unreachable/timed out). The result
+	// is then the CRD-derived view with DegradeReason set — a graceful degrade
+	// (spec §3.2/§10), never a hard failure. Live is nil in this case.
+	Degraded      bool
+	DegradeReason string // bounded "why the live detail is unavailable"; set only when Degraded.
+	Verbose       bool
 }
 
 // Get performs the two-phase read. Phase 1 reads the RayJob CRD. If the job is
@@ -84,11 +93,17 @@ func (s *JobService) Get(ctx context.Context, req JobGetRequest) (JobGetResult, 
 
 	endpoint, err := s.reach.Endpoint(ctx, namespace, detail.RayClusterName, dashboardPort)
 	if err != nil {
+		if reason, ok := degradeReason(err); ok {
+			return JobGetResult{Detail: gateRaw(detail, req.Verbose), Scheduled: true, Degraded: true, DegradeReason: reason, Verbose: req.Verbose}, nil
+		}
 		return JobGetResult{}, err
 	}
 
 	live, err := s.api.JobStatus(ctx, endpoint, detail.JobID)
 	if err != nil {
+		if reason, ok := degradeReason(err); ok {
+			return JobGetResult{Detail: gateRaw(detail, req.Verbose), Scheduled: true, Degraded: true, DegradeReason: reason, Verbose: req.Verbose}, nil
+		}
 		return JobGetResult{}, err
 	}
 
@@ -110,7 +125,12 @@ type JobLogsRequest struct {
 type JobLogsResult struct {
 	Detail    JobDetail
 	Scheduled bool
-	Logs      *RayJobLogs // the bounded tail; nil when not scheduled.
+	Logs      *RayJobLogs // the bounded tail; nil when not scheduled OR when degraded.
+	// Degraded/DegradeReason mirror JobGetResult: a scheduled job whose dashboard
+	// is unreachable yields the CRD-derived view (no logs) rather than a hard
+	// failure (spec §3.2/§10).
+	Degraded      bool
+	DegradeReason string
 }
 
 // Logs performs the same two-phase resolution as Get, dialing
@@ -130,11 +150,17 @@ func (s *JobService) Logs(ctx context.Context, req JobLogsRequest) (JobLogsResul
 
 	endpoint, err := s.reach.Endpoint(ctx, namespace, detail.RayClusterName, dashboardPort)
 	if err != nil {
+		if reason, ok := degradeReason(err); ok {
+			return JobLogsResult{Detail: detail, Scheduled: true, Degraded: true, DegradeReason: reason}, nil
+		}
 		return JobLogsResult{}, err
 	}
 
 	logs, err := s.api.JobLogs(ctx, endpoint, detail.JobID, LogOptions{TailLines: req.TailLines, MaxBytes: req.MaxBytes})
 	if err != nil {
+		if reason, ok := degradeReason(err); ok {
+			return JobLogsResult{Detail: detail, Scheduled: true, Degraded: true, DegradeReason: reason}, nil
+		}
 		return JobLogsResult{}, err
 	}
 
@@ -154,6 +180,30 @@ func (s *JobService) Logs(ctx context.Context, req JobLogsRequest) (JobLogsResul
 // error where the honest answer is "not yet scheduled".
 func scheduled(detail JobDetail) bool {
 	return detail.JobID != "" && detail.DashboardURL != ""
+}
+
+// degradeReason classifies a phase-2 error: an AVAILABILITY failure (the head
+// endpoint could not be resolved, or the dashboard dial was unreachable or timed
+// out) degrades gracefully (spec §3.2/§10) — the caller keeps the CRD-derived
+// view and surfaces the bounded reason, never a hard failure. A dashboard 404
+// (NotFoundError = reachable, but the submission id is unknown to the dashboard)
+// is a real signal, not unreachability, so it propagates unchanged for the agent
+// to act on; so does any other unexpected error. The bool is the degrade
+// decision; the string is the bounded "live Ray detail unavailable: <why>"
+// reason. Note: an RBAC denial during head resolution never reaches here as a
+// ForbiddenError — the reachability resolver collapses it into a
+// RayAPIUnreachableError by design (spec §4), so it degrades like any other
+// unreachability.
+func degradeReason(err error) (string, bool) {
+	var unreachable *RayAPIUnreachableError
+	if errors.As(err, &unreachable) {
+		return unreachable.Reason, true
+	}
+	var timeout *TimeoutError
+	if errors.As(err, &timeout) {
+		return timeout.Error(), true
+	}
+	return "", false
 }
 
 // gateRaw strips the full object unless verbose was requested (spec §10:
