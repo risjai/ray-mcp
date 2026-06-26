@@ -22,7 +22,10 @@ type fakeWriteBackend struct {
 	// serverExtra, when set, is merged into the returned object's spec so the
 	// read-back diff surfaces a server-defaulted field.
 	serverExtra map[string]any
-	applyErr    error
+	// serverStatus, when set, is placed on the returned object's status so the
+	// non-blocking submit can project the read-back jobId/jobDeploymentStatus.
+	serverStatus map[string]any
+	applyErr     error
 
 	deleteCalls []deleteRecord
 	deleteErr   error
@@ -61,6 +64,26 @@ func (f *fakeWriteBackend) BuildClusterBase(p domain.ClusterCreateParams) (domai
 	}, nil
 }
 
+// BuildJobBase builds a minimal identity-carrying RayJob base mirroring the real
+// adapter's mode mapping (clusterSelector vs rayClusterSpec) so the MCP submit
+// tests can drive both modes through the in-memory client. By the time this is
+// called the service has validated the XOR, so exactly one target is set.
+func (f *fakeWriteBackend) BuildJobBase(p domain.JobSubmitParams) (domain.MergedSpec, error) {
+	spec := map[string]any{"entrypoint": p.Entrypoint}
+	if p.ExistingCluster != "" {
+		spec["clusterSelector"] = map[string]any{"ray.io/cluster": p.ExistingCluster}
+	}
+	if p.ClusterSpec != nil {
+		spec["rayClusterSpec"] = map[string]any{"rayVersion": p.ClusterSpec.RayVersion}
+	}
+	return domain.MergedSpec{
+		"apiVersion": "ray.io/v1",
+		"kind":       "RayJob",
+		"metadata":   map[string]any{"name": p.Name, "namespace": p.Namespace},
+		"spec":       spec,
+	}, nil
+}
+
 func (f *fakeWriteBackend) Apply(_ context.Context, kind domain.Kind, namespace, name string, spec domain.MergedSpec, opts domain.ApplyOptions) (domain.MergedSpec, error) {
 	f.applyCalls = append(f.applyCalls, applyRecord{kind: kind, namespace: namespace, name: name, dryRun: opts.DryRun, force: opts.Force})
 	if f.applyErr != nil {
@@ -78,6 +101,11 @@ func (f *fakeWriteBackend) Apply(_ context.Context, kind domain.Kind, namespace,
 		for k, v := range f.serverExtra {
 			s[k] = v
 		}
+	}
+	// serverStatus stands in for the controller-populated status subresource so the
+	// non-blocking submit can read back jobId/jobDeploymentStatus.
+	if len(f.serverStatus) > 0 {
+		out["status"] = runtimeClone(f.serverStatus)
 	}
 	return out, nil
 }
