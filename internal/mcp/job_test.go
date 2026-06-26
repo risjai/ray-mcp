@@ -360,6 +360,174 @@ func TestJobLogsDegradesGracefullyWhenDashboardUnreachable(t *testing.T) {
 	}
 }
 
+// TestListToolsShowsJobWaitWithReadOnlyHint asserts ray_job_wait is registered
+// and annotated read-only alongside the other job tools.
+func TestListToolsShowsJobWaitWithReadOnlyHint(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "default"}
+	session := connectJobs(t, cfg, wedgeFor(map[string]domain.JobDetail{}, fakeRayAPI{}))
+
+	res, err := session.ListTools(context.Background(), &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var tool *mcp.Tool
+	for _, tl := range res.Tools {
+		if tl.Name == "ray_job_wait" {
+			tool = tl
+		}
+	}
+	if tool == nil {
+		t.Fatalf("ray_job_wait not registered; got %v", res.Tools)
+	}
+	if tool.Annotations == nil || !tool.Annotations.ReadOnlyHint {
+		t.Errorf("ray_job_wait missing readOnlyHint annotation: %+v", tool.Annotations)
+	}
+}
+
+// TestJobWaitReachedRunning asserts ray_job_wait returns reached=true with the
+// live status for a RUNNING job under the default until=running. WaitSeconds=0
+// keeps the call to a single poll (no real sleeping in the MCP-wired service).
+func TestJobWaitReachedRunning(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	jobs := map[string]domain.JobDetail{"demo/trainer": scheduledJobDetail("demo", "trainer")}
+	api := fakeRayAPI{status: map[string]domain.RayJobStatus{
+		"raysubmit_xyz": {JobID: "raysubmit_xyz", Status: "RUNNING"},
+	}}
+	session := connectJobs(t, cfg, wedgeFor(jobs, api))
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_job_wait",
+		Arguments: map[string]any{"name": "trainer", "waitSeconds": 0},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool reported error: %+v", res)
+	}
+	sc := res.StructuredContent.(map[string]any)
+	if sc["reached"] != true {
+		t.Errorf("reached = %v, want true", sc["reached"])
+	}
+	if sc["until"] != "running" {
+		t.Errorf("until = %v, want running (default)", sc["until"])
+	}
+	if sc["jobStatus"] != "RUNNING" {
+		t.Errorf("jobStatus = %v, want RUNNING (live)", sc["jobStatus"])
+	}
+	if textContent(res) == "" {
+		t.Error("no text summary in result content")
+	}
+}
+
+// TestJobWaitNotReachedPending asserts a single-poll wait on a PENDING job
+// returns a clean reached=false (the honest "not yet" answer, not an error).
+func TestJobWaitNotReachedPending(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	jobs := map[string]domain.JobDetail{"demo/trainer": scheduledJobDetail("demo", "trainer")}
+	api := fakeRayAPI{status: map[string]domain.RayJobStatus{
+		"raysubmit_xyz": {JobID: "raysubmit_xyz", Status: "PENDING"},
+	}}
+	session := connectJobs(t, cfg, wedgeFor(jobs, api))
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_job_wait",
+		Arguments: map[string]any{"name": "trainer", "until": "running", "waitSeconds": 0},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool reported error for a not-yet-running job (want clean reached=false): %+v", res)
+	}
+	sc := res.StructuredContent.(map[string]any)
+	if sc["reached"] != false {
+		t.Errorf("reached = %v, want false", sc["reached"])
+	}
+}
+
+// TestJobWaitPreSchedulingFailureReadsTerminal asserts a job that terminally
+// fails BEFORE it is ever scheduled (jobDeploymentStatus=Failed, no jobId) is
+// reported as reached with a terminal summary derived from the CRD lifecycle —
+// not the contradictory "not yet scheduled" wording (Live is nil on this path,
+// so the summary must read succeeded-vs-failed off jobDeploymentStatus).
+func TestJobWaitPreSchedulingFailureReadsTerminal(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	jobs := map[string]domain.JobDetail{"demo/doomed": {
+		JobSummary:          domain.JobSummary{Name: "doomed", Namespace: "demo"},
+		JobDeploymentStatus: "Failed", // terminal on the CRD; never scheduled.
+	}}
+	// nil-ish API: a pre-scheduling-failed job must NOT be dialed.
+	session := connectJobs(t, cfg, wedgeFor(jobs, fakeRayAPI{}))
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_job_wait",
+		Arguments: map[string]any{"name": "doomed", "until": "terminal", "waitSeconds": 0},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool reported error for a terminally-failed job (want clean reached=true): %+v", res)
+	}
+	sc := res.StructuredContent.(map[string]any)
+	if sc["reached"] != true {
+		t.Errorf("reached = %v, want true (Failed is terminal)", sc["reached"])
+	}
+	if sc["deploymentStatus"] != "Failed" {
+		t.Errorf("deploymentStatus = %v, want Failed", sc["deploymentStatus"])
+	}
+	txt := textContent(res)
+	if strings.Contains(txt, "not yet scheduled") {
+		t.Errorf("summary = %q, must not call a terminally-failed job 'not yet scheduled'", txt)
+	}
+	if !strings.Contains(txt, "Failed") {
+		t.Errorf("summary = %q, want the terminal Failed lifecycle surfaced", txt)
+	}
+}
+
+// TestJobWaitMissingNameErrors asserts an empty name is a validation error.
+func TestJobWaitMissingNameErrors(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	session := connectJobs(t, cfg, wedgeFor(map[string]domain.JobDetail{}, fakeRayAPI{}))
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_job_wait",
+		Arguments: map[string]any{"waitSeconds": 0},
+	})
+	if err != nil {
+		t.Fatalf("CallTool transport error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("empty name did not produce a tool error: %+v", res)
+	}
+}
+
+// TestJobWaitInvalidUntilErrors asserts an unrecognized until value is rejected
+// at the edge rather than silently treated as the default.
+func TestJobWaitInvalidUntilErrors(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "demo"}
+	jobs := map[string]domain.JobDetail{"demo/trainer": scheduledJobDetail("demo", "trainer")}
+	session := connectJobs(t, cfg, wedgeFor(jobs, fakeRayAPI{}))
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_job_wait",
+		Arguments: map[string]any{"name": "trainer", "until": "forever", "waitSeconds": 0},
+	})
+	if err != nil {
+		t.Fatalf("CallTool transport error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("invalid until did not produce a tool error: %+v", res)
+	}
+}
+
 // TestJobLogsNotScheduledNoLogs asserts logs on a not-yet-scheduled job report
 // scheduled=false with no logs (not an error).
 func TestJobLogsNotScheduledNoLogs(t *testing.T) {
