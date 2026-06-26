@@ -124,6 +124,64 @@ func TestWedgeTwoPhaseGetAndLogs(t *testing.T) {
 	}
 }
 
+// TestWedgeWaitReachesRunning proves ray_job_wait (Task 17) end-to-end through
+// the combined harness: phase 1 reads a scheduled RayJob from the real apiserver,
+// phase 2 dials the real rayapi client against an httptest dashboard reporting
+// RUNNING, and the bounded wait returns reached=true with the live status — no
+// real sleeping, since the condition is met on the first poll.
+func TestWedgeWaitReachesRunning(t *testing.T) {
+	adapter, k8s := startAdapter(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const (
+		namespace = "default"
+		name      = "wedge-wait"
+		jobID     = "raysubmit_wait1"
+		cluster   = "wedge-wait-raycluster"
+	)
+
+	dashboard := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/jobs/"+jobID {
+			writeJSON(t, w, `{"submission_id":%q,"status":"RUNNING","message":"training"}`, jobID)
+			return
+		}
+		t.Errorf("unexpected dashboard path %q", r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer dashboard.Close()
+
+	rj := newRayJob(namespace, name)
+	if err := k8s.Create(ctx, rj); err != nil {
+		t.Fatalf("create RayJob: %v", err)
+	}
+	rj.Status = rayv1.RayJobStatus{
+		JobId:               jobID,
+		RayClusterName:      cluster,
+		DashboardURL:        "http://" + name + "-head-svc.default.svc:8265",
+		JobStatus:           rayv1.JobStatusRunning,
+		JobDeploymentStatus: rayv1.JobDeploymentStatusRunning,
+	}
+	if err := k8s.Status().Update(ctx, rj); err != nil {
+		t.Fatalf("status subresource update: %v", err)
+	}
+
+	api := rayapi.NewClient(&config.Config{})
+	svc := domain.NewJobService(adapter, fixedEndpoint{baseURL: dashboard.URL}, api, namespace)
+
+	got, err := svc.Wait(ctx, domain.JobWaitRequest{Name: name, Until: "running", WaitSeconds: 30})
+	if err != nil {
+		t.Fatalf("JobService.Wait: %v", err)
+	}
+	if !got.Reached {
+		t.Errorf("Reached = false, want true for a RUNNING job under until=running")
+	}
+	if got.Live == nil || got.Live.Status != "RUNNING" {
+		t.Fatalf("Live = %+v, want the dashboard's RUNNING status", got.Live)
+	}
+}
+
 // TestWedgeNotScheduledNoDial proves the AC's negative path against the real
 // apiserver: a RayJob whose status has not reached the dial gate returns
 // "not scheduled" WITHOUT any dashboard dial. A dashboard that fails the test if

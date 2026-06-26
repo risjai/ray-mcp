@@ -66,9 +66,40 @@ type JobLogsOutput struct {
 	BytesOmitted  int    `json:"bytesOmitted,omitempty" jsonschema:"a floor on how many bytes of the full buffer were dropped"`
 }
 
-// addJobTools registers ray_job_get and ray_job_logs against the domain
-// JobService. Both are read-only; the handlers do validation + mapping only,
-// with the two-phase orchestration policy living in the service.
+// jobWaitInput is the ray_job_wait argument object. Name is required; until is
+// "running" (default) or "terminal"; waitSeconds is the bound, clamped to ≤30 by
+// the service (spec §7.A, Q11).
+type jobWaitInput struct {
+	Name        string `json:"name"                  jsonschema:"the RayJob name (required)"`
+	Namespace   string `json:"namespace,omitempty"   jsonschema:"namespace of the RayJob; defaults to the server default namespace"`
+	Until       string `json:"until,omitempty"       jsonschema:"the condition to wait for: 'running' (default — started or already finished) or 'terminal' (succeeded/failed/stopped)"`
+	WaitSeconds int    `json:"waitSeconds,omitempty" jsonschema:"max seconds to wait, clamped to 30; the call returns promptly with reached=false if the condition is not met in time"`
+}
+
+// JobWaitOutput is the structured ray_job_wait result: whether the condition was
+// reached within the bound, plus the final observed view. reached=false is the
+// honest "not yet" answer (e.g. still Pending at the cap), never an error — the
+// agent re-polls. The live Ray fields are present when the job was scheduled and
+// the dashboard answered; degraded mirrors ray_job_get when it did not.
+type JobWaitOutput struct {
+	Name             string `json:"name"`
+	Namespace        string `json:"namespace"`
+	Until            string `json:"until" jsonschema:"the condition waited for: running or terminal"`
+	Reached          bool   `json:"reached" jsonschema:"true if the job reached the requested condition within waitSeconds; false means not yet (re-poll), not an error"`
+	Scheduled        bool   `json:"scheduled" jsonschema:"true once status.jobId+dashboardURL are set; false means not yet scheduled"`
+	Degraded         bool   `json:"degraded" jsonschema:"true when the job is scheduled but the live Ray dashboard was unreachable on the final poll, so this is the CRD-derived view only"`
+	DegradeReason    string `json:"degradeReason,omitempty" jsonschema:"when degraded, the bounded reason the live Ray detail was unavailable"`
+	JobID            string `json:"jobId,omitempty" jsonschema:"the Ray submission id (status.jobId); empty before scheduling"`
+	RayClusterName   string `json:"rayClusterName,omitempty" jsonschema:"the RayCluster backing this job (status.rayClusterName)"`
+	DeploymentStatus string `json:"deploymentStatus" jsonschema:"the CRD lifecycle phase (status.jobDeploymentStatus)"`
+	JobStatus        string `json:"jobStatus,omitempty" jsonschema:"the Ray driver phase: live from the dashboard when scheduled+reachable, else the CRD's cached status.jobStatus"`
+	Message          string `json:"message,omitempty" jsonschema:"a bounded status/failure message when present"`
+	Health           string `json:"health" jsonschema:"1-line distilled health summary"`
+}
+
+// addJobTools registers ray_job_get, ray_job_logs and ray_job_wait against the
+// domain JobService. All are read-only; the handlers do validation + mapping
+// only, with the two-phase orchestration policy living in the service.
 func addJobTools(server *mcp.Server, svc *domain.JobService) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "ray_job_get",
@@ -116,6 +147,34 @@ func addJobTools(server *mcp.Server, svc *domain.JobService) {
 		out := toJobLogsOutput(res)
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: jobLogsSummary(out)}},
+		}, out, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ray_job_wait",
+		Description: "Wait (bounded, ≤30s) for a RayJob to reach a condition: 'running' (default — started executing, or already finished) answers 'did it start or is it stuck Pending?'; 'terminal' waits for succeeded/failed/stopped. Returns the current distilled status plus a 'reached' flag — reached=false means not yet (re-poll), never an error. Read-only.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in jobWaitInput) (*mcp.CallToolResult, JobWaitOutput, error) {
+		if in.Name == "" {
+			return nil, JobWaitOutput{}, errors.New("name is required")
+		}
+		if in.Until != "" && in.Until != "running" && in.Until != "terminal" {
+			return nil, JobWaitOutput{}, fmt.Errorf("until must be 'running' or 'terminal', got %q", in.Until)
+		}
+
+		res, err := svc.Wait(ctx, domain.JobWaitRequest{
+			Namespace:   in.Namespace,
+			Name:        in.Name,
+			Until:       in.Until,
+			WaitSeconds: in.WaitSeconds,
+		})
+		if err != nil {
+			return nil, JobWaitOutput{}, mapDomainError(err) //nolint:wrapcheck // mapped to a clean, bounded tool error.
+		}
+
+		out := toJobWaitOutput(res)
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: jobWaitSummary(out)}},
 		}, out, nil
 	})
 }
@@ -175,6 +234,32 @@ func toJobLogsOutput(res domain.JobLogsResult) JobLogsOutput {
 	return out
 }
 
+// toJobWaitOutput maps the domain wait result to the structured output. As with
+// get, the live dashboard status (when present) is authoritative for the Ray
+// driver phase + message; otherwise the CRD's cached fields stand in.
+func toJobWaitOutput(res domain.JobWaitResult) JobWaitOutput {
+	d := res.Detail
+	out := JobWaitOutput{
+		Name:             d.Name,
+		Namespace:        d.Namespace,
+		Until:            res.Until,
+		Reached:          res.Reached,
+		Scheduled:        res.Scheduled,
+		Degraded:         res.Degraded,
+		DegradeReason:    res.DegradeReason,
+		JobID:            d.JobID,
+		RayClusterName:   d.RayClusterName,
+		DeploymentStatus: d.JobDeploymentStatus,
+		JobStatus:        d.JobStatus, // CRD-cached phase; overridden by live below.
+		Health:           d.Health,
+	}
+	if res.Live != nil {
+		out.JobStatus = res.Live.Status
+		out.Message = res.Live.Message
+	}
+	return out
+}
+
 // jobGetSummary renders the one-line human-readable text content. A not-yet-
 // scheduled job says so via the CRD lifecycle (deploymentStatus) rather than
 // surfacing an empty Ray status as if the job had run.
@@ -219,6 +304,43 @@ func jobLogsSummary(out JobLogsOutput) string {
 		)
 	}
 	return fmt.Sprintf("RayJob %q logs (full buffer)", out.Name)
+}
+
+// jobWaitSummary renders the one-line text content for a bounded wait, honest
+// about reached vs not-yet and about a degraded final poll.
+func jobWaitSummary(out JobWaitOutput) string {
+	verb := "reached"
+	if !out.Reached {
+		verb = "not yet reached"
+	}
+	if out.Degraded {
+		return fmt.Sprintf(
+			"RayJob %q in namespace %q: %s (until=%s); %s; live Ray detail unavailable: %s",
+			out.Name, out.Namespace, verb, out.Until,
+			deploymentOrUnknown(out.DeploymentStatus), out.DegradeReason,
+		)
+	}
+	// "not yet scheduled" applies only when the job genuinely has not been
+	// scheduled AND has not reached — a job that terminally fails BEFORE
+	// scheduling (jobDeploymentStatus=Failed, no jobId) is Reached but not
+	// Scheduled, and is reported by its CRD lifecycle, not as "not yet scheduled".
+	if !out.Scheduled && !out.Reached {
+		return fmt.Sprintf(
+			"RayJob %q in namespace %q: %s (until=%s) — not yet scheduled (%s)",
+			out.Name, out.Namespace, verb, out.Until, deploymentOrUnknown(out.DeploymentStatus),
+		)
+	}
+	// When reached via the CRD-terminal short-circuit the live dashboard is not
+	// dialed (Live nil), so the lifecycle phase carries the succeeded-vs-failed
+	// signal; Health stands in once the live view was fused.
+	detail := out.Health
+	if detail == "" {
+		detail = deploymentOrUnknown(out.DeploymentStatus)
+	}
+	return fmt.Sprintf(
+		"RayJob %q in namespace %q: %s (until=%s); %s",
+		out.Name, out.Namespace, verb, out.Until, detail,
+	)
 }
 
 // deploymentOrUnknown renders the CRD lifecycle phase, mapping the empty (New)
