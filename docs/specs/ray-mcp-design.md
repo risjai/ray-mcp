@@ -806,7 +806,8 @@ modes imply:
   **`false`** (verified) → orphaned GPU-burning clusters (cost surprise);
   flipping to `true` risks the cluster being gone before post-mortem (lost
   debugging). **Lean:** default `true` with a "pass `false` to keep for debugging"
-  hint surfaced in the result. **Not yet ratified.**
+  hint surfaced in the result. **✅ Ratified (human-decided 2026-06-26):** default
+  `true` (ephemeral mode only) + the documented hint; shipped in Task 18.
 
 **✅ Q15 open item — CLOSED (verified 2026-06-13).** The official go-sdk
 dependency was confirmed against primary sources: latest release **v1.6.1

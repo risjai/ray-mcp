@@ -59,6 +59,10 @@ func (f *fakeKubeRay) BuildClusterBase(_ domain.ClusterCreateParams) (domain.Mer
 	return nil, errors.New("fakeKubeRay.BuildClusterBase not used in read-path tests")
 }
 
+func (f *fakeKubeRay) BuildJobBase(_ domain.JobSubmitParams) (domain.MergedSpec, error) {
+	return nil, errors.New("fakeKubeRay.BuildJobBase not used in read-path tests")
+}
+
 func (f *fakeKubeRay) Apply(_ context.Context, _ domain.Kind, _, _ string, _ domain.MergedSpec, _ domain.ApplyOptions) (domain.MergedSpec, error) {
 	return nil, errors.New("fakeKubeRay.Apply not used in read-path tests")
 }

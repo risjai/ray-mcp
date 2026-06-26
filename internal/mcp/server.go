@@ -8,15 +8,16 @@ import (
 	"github.com/risjai/ray-mcp/internal/version"
 )
 
-// ClusterWriteBackend is the write slice NewServer needs to register the mutating
-// RayCluster tools: the curated→base builder (spec §7.C step 1), the SSA Applier
-// (Task 8b), and the Deleter (Task 12, destructive tier). The KubeRay adapter
-// satisfies all three; they are bundled into one narrow interface so NewServer
-// takes a single backend handle (the adapter) rather than a growing parameter
-// list, and tests can inject a fake. It is only consulted when
+// WriteBackend is the write slice NewServer needs to register the mutating tools:
+// the curated→base builders for RayCluster (spec §7.C step 1) and RayJob (Task 18),
+// the shared SSA Applier (Task 8b), and the Deleter (Task 12, destructive tier).
+// The KubeRay adapter satisfies all of them; they are bundled into one narrow
+// interface so NewServer takes a single backend handle (the adapter) rather than a
+// growing parameter list, and tests can inject a fake. It is only consulted when
 // cfg.AllowMutations is set.
-type ClusterWriteBackend interface {
+type WriteBackend interface {
 	domain.ClusterBaseBuilder
+	domain.JobBaseBuilder
 	domain.Applier
 	domain.Deleter
 }
@@ -24,7 +25,7 @@ type ClusterWriteBackend interface {
 // WedgeBackend bundles the three collaborators the RayJob read tools (the
 // cross-plane "wedge", spec §5/§7.B) need: the phase-1 CRD reader (Jobs), the
 // head-endpoint resolver (Reach), and the read-only Ray dashboard client (API).
-// Unlike ClusterWriteBackend these are three DIFFERENT adapters, so the bundle is
+// Unlike WriteBackend these are three DIFFERENT adapters, so the bundle is
 // a struct, not one interface. The wedge tools register only when Jobs is
 // non-nil, so a cluster-only server (or a test that does not exercise the wedge)
 // simply leaves it zero — matching the "tools are advertised only when wired"
@@ -45,7 +46,7 @@ type WedgeBackend struct {
 // mutation via audit. All collaborators are narrow interfaces so tests can inject
 // fakes. It returns the underlying *mcp.Server so the caller can run it over any
 // transport (stdio in main, in-memory in tests).
-func NewServer(cfg *config.Config, src capabilitiesSource, kube domain.ClusterReader, write ClusterWriteBackend, wedge WedgeBackend, audit domain.AuditSink) *mcp.Server {
+func NewServer(cfg *config.Config, src capabilitiesSource, kube domain.ClusterReader, write WriteBackend, wedge WedgeBackend, audit domain.AuditSink) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "ray-mcp",
 		Version: version.Version,
@@ -64,6 +65,11 @@ func NewServer(cfg *config.Config, src capabilitiesSource, kube domain.ClusterRe
 		applySvc := domain.NewApplyService(write, audit)
 		writeSvc := domain.NewClusterWriteService(write, kube, write, applySvc, cfg.DefaultNamespace)
 		addClusterWriteTools(server, writeSvc, cfg.AllowRawSpec, cfg.AllowDestructive)
+
+		// RayJob writes (Task 18) share the one apply pipeline (and thus the one
+		// audit sink) with the cluster writes; the adapter is also the JobBaseBuilder.
+		jobWriteSvc := domain.NewJobWriteService(write, applySvc, cfg.DefaultNamespace)
+		addJobWriteTools(server, jobWriteSvc, cfg.AllowRawSpec)
 	}
 
 	return server
