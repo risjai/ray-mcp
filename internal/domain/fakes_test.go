@@ -31,11 +31,13 @@ type fakeKubeRay struct {
 
 	applied MergedSpec // last spec passed to Apply.
 
-	// listClustersContinue, when set, is returned verbatim as the ClusterList
-	// continue token so a test can drive the "more available" signal without a
-	// real paginating backend. lastListOpts captures the options the service
-	// passed through (to assert namespace defaulting / allNamespaces).
+	// listClustersContinue / listJobsContinue, when set, are returned verbatim as
+	// the respective list's continue token so a test can drive the "more available"
+	// signal without a real paginating backend. lastListOpts captures the options
+	// the service passed through (to assert namespace defaulting / allNamespaces /
+	// limit / continue) — set by ListClusters and ListJobs alike.
 	listClustersContinue string
+	listJobsContinue     string
 	lastListOpts         ListOptions
 
 	// lastEventsNamespace / lastEventsLimit capture the args the service passed
@@ -68,15 +70,17 @@ func (f *fakeKubeRay) GetCluster(_ context.Context, namespace, name string) (Clu
 	return c, nil
 }
 
-func (f *fakeKubeRay) ListJobs(_ context.Context, namespace string, _ ListOptions) (JobList, error) {
+func (f *fakeKubeRay) ListJobs(_ context.Context, namespace string, opts ListOptions) (JobList, error) {
+	f.lastListOpts = opts
+
 	var items []JobSummary
 	for _, j := range f.jobs {
-		if j.Namespace == namespace {
+		if opts.AllNamespaces || j.Namespace == namespace {
 			items = append(items, j.JobSummary)
 		}
 	}
 
-	return JobList{Items: items, Continue: ""}, nil
+	return JobList{Items: items, Continue: f.listJobsContinue}, nil
 }
 
 func (f *fakeKubeRay) GetJob(_ context.Context, namespace, name string) (JobDetail, error) {

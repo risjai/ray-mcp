@@ -71,6 +71,10 @@ func (f *fakeKubeRay) Delete(_ context.Context, _ domain.Kind, _, _ string, _ bo
 	return errors.New("fakeKubeRay.Delete not used in read-path tests")
 }
 
+func (f *fakeKubeRay) GetJob(_ context.Context, _, _ string) (domain.JobDetail, error) {
+	return domain.JobDetail{}, errors.New("fakeKubeRay.GetJob not used in read-path tests")
+}
+
 // connectCluster wires a server (built from cfg + src + the kube fake) to an
 // in-memory client session.
 func connectCluster(t *testing.T, cfg *config.Config, kube domain.ClusterReader) *mcp.ClientSession {

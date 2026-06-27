@@ -13,9 +13,21 @@ import (
 )
 
 // fakeJobReader implements domain.JobReader for the MCP-layer job tests. Tests
-// seed jobs keyed by namespace/name directly.
+// seed jobs keyed by namespace/name directly; listContinue drives the
+// "more available" pagination signal for the ray_job_list tests.
 type fakeJobReader struct {
-	jobs map[string]domain.JobDetail
+	jobs         map[string]domain.JobDetail
+	listContinue string
+}
+
+func (f *fakeJobReader) ListJobs(_ context.Context, namespace string, opts domain.ListOptions) (domain.JobList, error) {
+	var items []domain.JobSummary
+	for _, j := range f.jobs {
+		if opts.AllNamespaces || j.Namespace == namespace {
+			items = append(items, j.JobSummary)
+		}
+	}
+	return domain.JobList{Items: items, Continue: f.listContinue}, nil
 }
 
 func (f *fakeJobReader) GetJob(_ context.Context, namespace, name string) (domain.JobDetail, error) {
@@ -73,12 +85,11 @@ func connectJobs(t *testing.T, cfg *config.Config, wedge mcpserver.WedgeBackend)
 func scheduledJobDetail(namespace, name string) domain.JobDetail {
 	return domain.JobDetail{
 		JobSummary: domain.JobSummary{
-			Name: name, Namespace: namespace, JobStatus: "RUNNING", Health: "Running; job RUNNING",
+			Name: name, Namespace: namespace, JobStatus: "RUNNING", JobDeploymentStatus: "Running", Health: "Running; job RUNNING",
 		},
-		JobID:               "raysubmit_xyz",
-		DashboardURL:        "http://" + name + "-head.svc:8265",
-		JobDeploymentStatus: "Running",
-		RayClusterName:      name + "-cluster",
+		JobID:          "raysubmit_xyz",
+		DashboardURL:   "http://" + name + "-head.svc:8265",
+		RayClusterName: name + "-cluster",
 	}
 }
 
@@ -180,8 +191,7 @@ func TestJobGetNotScheduledReportsClean(t *testing.T) {
 	t.Parallel()
 	cfg := &config.Config{DefaultNamespace: "demo"}
 	jobs := map[string]domain.JobDetail{"demo/pending": {
-		JobSummary:          domain.JobSummary{Name: "pending", Namespace: "demo"},
-		JobDeploymentStatus: "Initializing",
+		JobSummary: domain.JobSummary{Name: "pending", Namespace: "demo", JobDeploymentStatus: "Initializing"},
 	}}
 	// nil-ish API: the dashboard must NOT be dialed for a not-scheduled job.
 	session := connectJobs(t, cfg, wedgeFor(jobs, fakeRayAPI{}))
@@ -458,8 +468,7 @@ func TestJobWaitPreSchedulingFailureReadsTerminal(t *testing.T) {
 	t.Parallel()
 	cfg := &config.Config{DefaultNamespace: "demo"}
 	jobs := map[string]domain.JobDetail{"demo/doomed": {
-		JobSummary:          domain.JobSummary{Name: "doomed", Namespace: "demo"},
-		JobDeploymentStatus: "Failed", // terminal on the CRD; never scheduled.
+		JobSummary: domain.JobSummary{Name: "doomed", Namespace: "demo", JobDeploymentStatus: "Failed"}, // terminal on the CRD; never scheduled.
 	}}
 	// nil-ish API: a pre-scheduling-failed job must NOT be dialed.
 	session := connectJobs(t, cfg, wedgeFor(jobs, fakeRayAPI{}))
@@ -534,8 +543,7 @@ func TestJobLogsNotScheduledNoLogs(t *testing.T) {
 	t.Parallel()
 	cfg := &config.Config{DefaultNamespace: "demo"}
 	jobs := map[string]domain.JobDetail{"demo/pending": {
-		JobSummary:          domain.JobSummary{Name: "pending", Namespace: "demo"},
-		JobDeploymentStatus: "Initializing",
+		JobSummary: domain.JobSummary{Name: "pending", Namespace: "demo", JobDeploymentStatus: "Initializing"},
 	}}
 	session := connectJobs(t, cfg, wedgeFor(jobs, fakeRayAPI{}))
 

@@ -12,6 +12,49 @@ import (
 	"github.com/risjai/ray-mcp/internal/domain"
 )
 
+// ListJobs returns a page of compact RayJob summaries plus the k8s continue token
+// for the next page. It mirrors ListClusters: namespace scope (or all
+// namespaces), a hard page cap (defaulting to defaultListLimit), and the opaque
+// continue token surfaced unchanged so the domain reports "N shown, continue
+// token X" rather than silently truncating (spec §10). Each row carries both the
+// Ray-side job status and the CRD deployment status via toJobSummary.
+func (c *Client) ListJobs(ctx context.Context, namespace string, opts domain.ListOptions) (domain.JobList, error) {
+	k8s, err := c.ensureClient()
+	if err != nil {
+		return domain.JobList{}, err
+	}
+
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = defaultListLimit
+	}
+
+	listOpts := []client.ListOption{client.Limit(limit)}
+	if opts.AllNamespaces {
+		listOpts = append(listOpts, client.InNamespace(""))
+	} else {
+		listOpts = append(listOpts, client.InNamespace(namespace))
+	}
+	if opts.Continue != "" {
+		listOpts = append(listOpts, client.Continue(opts.Continue))
+	}
+
+	var rjl rayv1.RayJobList
+	if err := k8s.List(ctx, &rjl, listOpts...); err != nil {
+		return domain.JobList{}, mapK8sError(err, "list", domain.KindRayJob, namespace, "")
+	}
+
+	items := make([]domain.JobSummary, 0, len(rjl.Items))
+	for i := range rjl.Items {
+		items = append(items, toJobSummary(&rjl.Items[i]))
+	}
+
+	return domain.JobList{
+		Items:    items,
+		Continue: rjl.Continue,
+	}, nil
+}
+
 // GetJob returns the distilled detail for one RayJob — phase 1 of the two-phase
 // wedge read (Task 16a). It maps the operator-written status identity fields that
 // bridge the k8s name to the Ray submission id and dashboard endpoint
@@ -32,16 +75,18 @@ func (c *Client) GetJob(ctx context.Context, namespace, name string) (domain.Job
 	return toJobDetail(&rj)
 }
 
-// toJobSummary maps a typed RayJob to the compact list row. JobStatus is the
-// Ray-side phase (status.jobStatus), distinct from the CRD lifecycle
-// (status.jobDeploymentStatus) carried on the detail.
+// toJobSummary maps a typed RayJob to the compact list row. It carries BOTH the
+// Ray-side phase (status.jobStatus) and the CRD lifecycle
+// (status.jobDeploymentStatus) — the two status fields ray_job_list surfaces side
+// by side (spec §10).
 func toJobSummary(rj *rayv1.RayJob) domain.JobSummary {
 	return domain.JobSummary{
-		Name:      rj.Name,
-		Namespace: rj.Namespace,
-		JobStatus: string(rj.Status.JobStatus),
-		Age:       jobAge(rj),
-		Health:    jobHealth(rj),
+		Name:                rj.Name,
+		Namespace:           rj.Namespace,
+		JobStatus:           string(rj.Status.JobStatus),
+		JobDeploymentStatus: string(rj.Status.JobDeploymentStatus),
+		Age:                 jobAge(rj),
+		Health:              jobHealth(rj),
 	}
 }
 
@@ -59,12 +104,11 @@ func toJobDetail(rj *rayv1.RayJob) (domain.JobDetail, error) {
 	}
 
 	return domain.JobDetail{
-		JobSummary:          toJobSummary(rj),
-		JobID:               rj.Status.JobId,
-		DashboardURL:        rj.Status.DashboardURL,
-		JobDeploymentStatus: string(rj.Status.JobDeploymentStatus),
-		RayClusterName:      rj.Status.RayClusterName,
-		Raw:                 raw,
+		JobSummary:     toJobSummary(rj),
+		JobID:          rj.Status.JobId,
+		DashboardURL:   rj.Status.DashboardURL,
+		RayClusterName: rj.Status.RayClusterName,
+		Raw:            raw,
 	}, nil
 }
 

@@ -79,6 +79,27 @@ type JobBaseBuilder interface {
 	BuildJobBase(p JobSubmitParams) (MergedSpec, error)
 }
 
+// JobGetter is the narrow read slice the delete pipeline needs: fetch the live
+// RayJob to read its mode (ephemeral vs existing-cluster), protected annotation,
+// and identity for the confirm fingerprint. It mirrors ClusterGetter; the KubeRay
+// adapter and the full JobReader both satisfy it. JobDetail.Raw carries the full
+// unstructured object the guards read.
+type JobGetter interface {
+	GetJob(ctx context.Context, namespace, name string) (JobDetail, error)
+}
+
+// JobDeleteParams is the decoded ray_job_delete argument set: the target identity,
+// the confirm fingerprint (empty for preview, echoed back for commit — used only
+// in the ephemeral mode), the AllowDestructive tier flag (gates the ephemeral
+// cascade, B3/Q16a), and the dryRun flag.
+type JobDeleteParams struct {
+	Namespace        string
+	Name             string
+	Confirm          string
+	AllowDestructive bool // the --allow-destructive tier; required for an ephemeral cascade (Q16a).
+	DryRun           bool
+}
+
 // JobWriteService is the orchestration layer for the RayJob write tools. It owns
 // the cross-cutting write policy the MCP layer must not duplicate: the
 // default-namespace fallback, the mode XOR + shutdown-default resolution, the
@@ -87,15 +108,18 @@ type JobBaseBuilder interface {
 // Merge, and the ApplyService.
 type JobWriteService struct {
 	base             JobBaseBuilder
+	get              JobGetter
+	del              Deleter
 	apply            *ApplyService
 	defaultNamespace string
 }
 
-// NewJobWriteService builds the service over the base builder, the apply pipeline
-// (Task 8b), and the default namespace (injected as a plain string so the domain
-// stays config/k8s-free).
-func NewJobWriteService(base JobBaseBuilder, apply *ApplyService, defaultNamespace string) *JobWriteService {
-	return &JobWriteService{base: base, apply: apply, defaultNamespace: defaultNamespace}
+// NewJobWriteService builds the service over the base builder (submit), the
+// live-object reader + deleter (mode-aware delete, Q16a), the apply pipeline (Task
+// 8b), and the default namespace (injected as a plain string so the domain stays
+// config/k8s-free).
+func NewJobWriteService(base JobBaseBuilder, get JobGetter, del Deleter, apply *ApplyService, defaultNamespace string) *JobWriteService {
+	return &JobWriteService{base: base, get: get, del: del, apply: apply, defaultNamespace: defaultNamespace}
 }
 
 // DefaultNamespace returns the namespace used when a submit omits one, so the MCP
@@ -175,6 +199,80 @@ func (s *JobWriteService) Submit(ctx context.Context, p JobSubmitParams) (JobSub
 		DeploymentStatus: deployStatus,
 		Diff:             res.Diff,
 	}, nil
+}
+
+// Delete runs the mode-aware delete pipeline for one RayJob (Q16a). The blast
+// radius is mode-dependent, so the tiering is too:
+//
+//   - EPHEMERAL (owns its cluster via spec.rayClusterSpec): deleting it cascades
+//     to the whole RayCluster and every actor/job on it — a destructive teardown.
+//     Gated behind the destructive tier (AllowDestructive) AND a confirm
+//     fingerprint (preview → commit), exactly like ray_cluster_delete.
+//   - EXISTING-CLUSTER (spec.clusterSelector): deleting it only removes the RayJob
+//     record; the targeted cluster is untouched. A plain write — no tier, no
+//     confirm.
+//
+// The order mirrors ClusterWriteService.Delete: resolve ns → require name →
+// GetJob (NotFound propagates) → protected check BEFORE any tier/confirm (a
+// protected job never yields a fingerprint, regardless of mode) → mode branch.
+// For the ephemeral branch the tier gate precedes the confirm gate, so a job that
+// would cascade never mints a fingerprint until the operator has opted into the
+// destructive tier. Both branches end at the shared Deleter + one audit record.
+func (s *JobWriteService) Delete(ctx context.Context, p JobDeleteParams) error {
+	p.Namespace = s.resolveNamespace(p.Namespace)
+	if p.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+
+	detail, err := s.get.GetJob(ctx, p.Namespace, p.Name)
+	if err != nil {
+		return err
+	}
+
+	if IsProtected(detail.Raw) {
+		return fmt.Errorf("deletion refused: RayJob %q is protected (ray-mcp/protected=%q); remove the annotation via rawSpec/update first", p.Name, protectedValue)
+	}
+
+	if jobIsEphemeral(detail.Raw) {
+		// Ephemeral cascade: destructive tier first, then confirm-fingerprint.
+		if !p.AllowDestructive {
+			return fmt.Errorf(
+				"deleting RayJob %q cascade-deletes its ephemeral RayCluster (and every actor/job on it) and requires --allow-destructive", p.Name)
+		}
+		if err := RequireConfirm(detail.Raw, OpDelete, p.Confirm); err != nil {
+			return err
+		}
+	}
+
+	delErr := s.del.Delete(ctx, KindRayJob, p.Namespace, p.Name, p.DryRun)
+	s.apply.RecordDestructive(ctx, "ray_job_delete", KindRayJob, p.Namespace, p.Name, jobDeleteArgsSummary(p), p.DryRun, delErr)
+	return delErr
+}
+
+// jobIsEphemeral classifies a live RayJob's cluster mode from its spec: ephemeral
+// iff it owns a cluster (spec.rayClusterSpec present) AND does not target an
+// existing one (spec.clusterSelector empty). clusterSelector WINS when both are
+// set — KubeRay treats a both-set RayJob as existing-cluster (it ignores
+// rayClusterSpec), so an attached job is never mis-tiered as a cascade. This
+// reads detail.Raw directly (no typed round-trip) so a wedge-era field newer than
+// the compiled KubeRay baseline cannot perturb the decision.
+func jobIsEphemeral(live MergedSpec) bool {
+	spec, _ := live["spec"].(map[string]any)
+	if spec == nil {
+		return false
+	}
+	if sel, ok := spec["clusterSelector"].(map[string]any); ok && len(sel) > 0 {
+		return false
+	}
+	rcs, ok := spec["rayClusterSpec"].(map[string]any)
+	return ok && rcs != nil
+}
+
+// jobDeleteArgsSummary builds the short, bounded audit summary for a job delete
+// (spec §8, Q8: a summary, never the full spec — and never the fingerprint).
+// Mirrors deleteArgsSummary for clusters.
+func jobDeleteArgsSummary(p JobDeleteParams) string {
+	return fmt.Sprintf("name=%s dryRun=%t", p.Name, p.DryRun)
 }
 
 // validate enforces the submit invariants before any cluster call, and resolves

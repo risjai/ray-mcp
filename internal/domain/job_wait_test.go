@@ -104,8 +104,7 @@ func TestJobWaitRunningNotScheduledNoDial(t *testing.T) {
 	t.Parallel()
 
 	job := JobDetail{
-		JobSummary:          JobSummary{Name: "early", Namespace: "default"},
-		JobDeploymentStatus: "Initializing",
+		JobSummary: JobSummary{Name: "early", Namespace: "default", JobDeploymentStatus: "Initializing"},
 	}
 	kube := newJobFake(job)
 	clock := newFakeClock()
@@ -138,8 +137,7 @@ func TestJobWaitCRDTerminalReachedWithoutDial(t *testing.T) {
 	for _, until := range []string{"running", "terminal"} {
 		for _, status := range []string{"Failed", "Complete", "ValidationFailed"} {
 			job := JobDetail{
-				JobSummary:          JobSummary{Name: "dead", Namespace: "default"},
-				JobDeploymentStatus: status, // terminal on the CRD; no jobId/dashboardURL ever set.
+				JobSummary: JobSummary{Name: "dead", Namespace: "default", JobDeploymentStatus: status}, // terminal on the CRD; no jobId/dashboardURL ever set.
 			}
 			kube := newJobFake(job)
 			// nil reach + nil api: a dial would panic, proving CRD-terminal short-circuits.
