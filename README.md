@@ -15,7 +15,9 @@ Read-only today; a guarded write path is on the way (see below).
 > status fused with the live Ray dashboard/job API), and the RayJob write/list path
 > (`ray_job_submit` / `ray_job_list` / `ray_job_delete` — delete is mode-aware:
 > deleting an ephemeral job cascades to its cluster, so that path is destructive),
-> over stdio. The remaining Ray service tools land next.
+> and the read-only RayService tools (`ray_service_list` / `ray_service_get` —
+> distilled rollout phase + serve health), over stdio. The RayService write path
+> (deploy / update / delete) lands next.
 
 ## Why ray-mcp
 
@@ -45,8 +47,8 @@ YAML. ray-mcp is built specifically for Ray, with the LLM as the consumer.
 - **The wedge** — a read-only reach into Ray's dashboard/job API for live job
   status and logs, the runtime detail the CRDs don't hold (this is where the
   distillation above extends to jobs: *"why is my job pending?"*).
-- **Ray job / service tools** — submit / get / logs / wait / list / delete for
-  RayJob and RayService, layered on the guarded write path below.
+- **RayService write tools** — deploy / update / delete for RayService, layered on
+  the guarded write path below (the RayService read tools already ship).
 
 ## Install
 
@@ -144,7 +146,8 @@ Needs Docker + kubectl + Go + Claude Code; ~20–30 min; fully disposable.
 | RayJob submit — `ray_job_submit` (non-blocking, existingCluster XOR ephemeral clusterSpec, dry-run, diffs) | ✅ Shipped (`--allow-mutations`) |
 | RayJob list — `ray_job_list` (both statuses per row: CRD lifecycle + Ray phase) | ✅ Shipped |
 | RayJob delete — `ray_job_delete` (mode-aware: ephemeral cascade is destructive + confirm-fingerprint, existing-cluster is a plain write, `protected` guard) | ✅ Shipped (`--allow-mutations`) |
-| RayService tools — deploy / update / list / get / delete | 📋 Planned |
+| RayService read — `ray_service_list` / `ray_service_get` (distilled rollout phase + serve health) | ✅ Shipped |
+| RayService writes — deploy / update / delete | 📋 Planned |
 | Streamable HTTP transport + auth (static bearer / TokenReview) | 📋 Planned |
 | Read-only RBAC floor — ServiceAccount + ClusterRole ([`deploy/rbac/`](deploy/rbac/)) | ✅ Shipped (read-only) |
 | Helm chart + in-cluster Deployment | 📋 Planned |

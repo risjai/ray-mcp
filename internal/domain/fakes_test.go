@@ -31,13 +31,15 @@ type fakeKubeRay struct {
 
 	applied MergedSpec // last spec passed to Apply.
 
-	// listClustersContinue / listJobsContinue, when set, are returned verbatim as
-	// the respective list's continue token so a test can drive the "more available"
-	// signal without a real paginating backend. lastListOpts captures the options
-	// the service passed through (to assert namespace defaulting / allNamespaces /
-	// limit / continue) — set by ListClusters and ListJobs alike.
+	// listClustersContinue / listJobsContinue / listServicesContinue, when set, are
+	// returned verbatim as the respective list's continue token so a test can drive
+	// the "more available" signal without a real paginating backend. lastListOpts
+	// captures the options the service passed through (to assert namespace
+	// defaulting / allNamespaces / limit / continue) — set by ListClusters,
+	// ListJobs and ListServices alike.
 	listClustersContinue string
 	listJobsContinue     string
+	listServicesContinue string
 	lastListOpts         ListOptions
 
 	// lastEventsNamespace / lastEventsLimit capture the args the service passed
@@ -92,15 +94,17 @@ func (f *fakeKubeRay) GetJob(_ context.Context, namespace, name string) (JobDeta
 	return j, nil
 }
 
-func (f *fakeKubeRay) ListServices(_ context.Context, namespace string, _ ListOptions) (ServiceList, error) {
+func (f *fakeKubeRay) ListServices(_ context.Context, namespace string, opts ListOptions) (ServiceList, error) {
+	f.lastListOpts = opts
+
 	var items []ServiceSummary
 	for _, s := range f.services {
-		if s.Namespace == namespace {
+		if opts.AllNamespaces || s.Namespace == namespace {
 			items = append(items, s.ServiceSummary)
 		}
 	}
 
-	return ServiceList{Items: items, Continue: ""}, nil
+	return ServiceList{Items: items, Continue: f.listServicesContinue}, nil
 }
 
 func (f *fakeKubeRay) GetService(_ context.Context, namespace, name string) (ServiceDetail, error) {

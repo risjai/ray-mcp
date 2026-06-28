@@ -56,6 +56,14 @@ func NewServer(cfg *config.Config, src capabilitiesSource, kube domain.ClusterRe
 	addCapabilitiesTool(server, cfg, src)
 	addClusterTools(server, domain.NewClusterService(kube, cfg.DefaultNamespace))
 
+	// The RayService read tools register when the read backend also satisfies the
+	// service read slice. The production adapter (passed as kube) does; a
+	// cluster-only reader does not, so its server simply omits them — matching the
+	// "tools are advertised only when wired" convention (spec §6).
+	if svcReader, ok := kube.(domain.ServiceReader); ok {
+		addServiceTools(server, domain.NewServiceService(svcReader, cfg.DefaultNamespace))
+	}
+
 	// The RayJob read tools (the wedge) register only when their backend is wired.
 	// main.go always wires it; a bare server (or a cluster-only test) leaves it zero.
 	if wedge.Jobs != nil {
