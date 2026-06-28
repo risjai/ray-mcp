@@ -18,13 +18,20 @@ import (
 // cluster read methods ray_cluster_list / ray_cluster_get drive. Tests seed
 // clusters + an optional continue token directly.
 type fakeKubeRay struct {
-	clusters   map[string]domain.ClusterDetail
-	continueTo string
-	events     map[string][]domain.Event
+	clusters          map[string]domain.ClusterDetail
+	continueTo        string
+	events            map[string][]domain.Event
+	services          map[string]domain.ServiceDetail
+	serviceContinueTo string
 }
 
-// compile-time proof the fake satisfies the narrow port NewServer takes.
-var _ domain.ClusterReader = (*fakeKubeRay)(nil)
+// compile-time proof the fake satisfies the narrow ports NewServer takes: the
+// cluster reader always, and the service reader so the (type-asserted) RayService
+// read tools register when this fake is wired as the read backend.
+var (
+	_ domain.ClusterReader = (*fakeKubeRay)(nil)
+	_ domain.ServiceReader = (*fakeKubeRay)(nil)
+)
 
 func clusterKey(ns, name string) string { return ns + "/" + name }
 
@@ -73,6 +80,27 @@ func (f *fakeKubeRay) Delete(_ context.Context, _ domain.Kind, _, _ string, _ bo
 
 func (f *fakeKubeRay) GetJob(_ context.Context, _, _ string) (domain.JobDetail, error) {
 	return domain.JobDetail{}, errors.New("fakeKubeRay.GetJob not used in read-path tests")
+}
+
+// ListServices / GetService back the RayService read tools (ray_service_list /
+// ray_service_get). Tests seed services + an optional continue token directly,
+// mirroring ListClusters / GetCluster.
+func (f *fakeKubeRay) ListServices(_ context.Context, namespace string, opts domain.ListOptions) (domain.ServiceList, error) {
+	var items []domain.ServiceSummary
+	for _, s := range f.services {
+		if opts.AllNamespaces || s.Namespace == namespace {
+			items = append(items, s.ServiceSummary)
+		}
+	}
+	return domain.ServiceList{Items: items, Continue: f.serviceContinueTo}, nil
+}
+
+func (f *fakeKubeRay) GetService(_ context.Context, namespace, name string) (domain.ServiceDetail, error) {
+	s, ok := f.services[clusterKey(namespace, name)]
+	if !ok {
+		return domain.ServiceDetail{}, &domain.NotFoundError{Kind: domain.KindRayService, Namespace: namespace, Name: name}
+	}
+	return s, nil
 }
 
 // connectCluster wires a server (built from cfg + src + the kube fake) to an
