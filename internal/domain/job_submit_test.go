@@ -40,7 +40,9 @@ func jobBaseFor(namespace, name string) MergedSpec {
 // with a recording audit sink, returning the service and the sink for assertions.
 func newJobWriteService(base JobBaseBuilder, applier Applier, defaultNS string) (*JobWriteService, *recordingSink) {
 	sink := &recordingSink{}
-	svc := NewJobWriteService(base, NewApplyService(applier, sink), defaultNS)
+	// Submit does not read or delete the live object, so the getter/deleter are nil
+	// here; the delete tests wire real ones (see newJobDeleteService).
+	svc := NewJobWriteService(base, nil, nil, NewApplyService(applier, sink), defaultNS)
 	return svc, sink
 }
 

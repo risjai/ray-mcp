@@ -22,14 +22,14 @@ func newJobFake(details ...JobDetail) *fakeKubeRay {
 func scheduledJob(namespace, name string) JobDetail {
 	return JobDetail{
 		JobSummary: JobSummary{
-			Name:      name,
-			Namespace: namespace,
-			JobStatus: "RUNNING",
+			Name:                name,
+			Namespace:           namespace,
+			JobStatus:           "RUNNING",
+			JobDeploymentStatus: "Running",
 		},
-		JobID:               "raysubmit_abc123",
-		DashboardURL:        "http://" + name + "-head-svc." + namespace + ".svc:8265",
-		JobDeploymentStatus: "Running",
-		RayClusterName:      name + "-cluster",
+		JobID:          "raysubmit_abc123",
+		DashboardURL:   "http://" + name + "-head-svc." + namespace + ".svc:8265",
+		RayClusterName: name + "-cluster",
 	}
 }
 
@@ -101,9 +101,8 @@ func TestJobGetNotScheduledNoJobID(t *testing.T) {
 	t.Parallel()
 
 	job := JobDetail{
-		JobSummary:          JobSummary{Name: "pending", Namespace: "default"},
-		DashboardURL:        "http://pending-head:8265", // present, but jobId is not.
-		JobDeploymentStatus: "Initializing",
+		JobSummary:   JobSummary{Name: "pending", Namespace: "default", JobDeploymentStatus: "Initializing"},
+		DashboardURL: "http://pending-head:8265", // present, but jobId is not.
 	}
 	kube := newJobFake(job)
 
@@ -132,9 +131,8 @@ func TestJobGetNotScheduledNoDashboardURL(t *testing.T) {
 	t.Parallel()
 
 	job := JobDetail{
-		JobSummary:          JobSummary{Name: "early", Namespace: "default"},
-		JobID:               "raysubmit_early", // set early, before the cluster is Ready.
-		JobDeploymentStatus: "Initializing",
+		JobSummary: JobSummary{Name: "early", Namespace: "default", JobDeploymentStatus: "Initializing"},
+		JobID:      "raysubmit_early", // set early, before the cluster is Ready.
 	}
 	kube := newJobFake(job)
 	svc := NewJobService(kube, nil, nil, "default")
@@ -391,8 +389,7 @@ func TestJobLogsNotScheduledNoLogs(t *testing.T) {
 	t.Parallel()
 
 	job := JobDetail{
-		JobSummary:          JobSummary{Name: "pending", Namespace: "default"},
-		JobDeploymentStatus: "Initializing",
+		JobSummary: JobSummary{Name: "pending", Namespace: "default", JobDeploymentStatus: "Initializing"},
 	}
 	kube := newJobFake(job)
 	svc := NewJobService(kube, nil, nil, "default")

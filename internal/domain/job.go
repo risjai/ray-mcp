@@ -13,11 +13,12 @@ import (
 const dashboardPort = 8265
 
 // JobReader is the narrow read slice of KubeRayPort the RayJob read tools need —
-// the phase-1 CRD read of the two-phase wedge. JobService depends on this (not
-// the full port) so callers wire only what these tools use, mirroring
-// ClusterReader. The KubeRay adapter satisfies it with GetJob; the full
-// KubeRayPort satisfies it too.
+// the phase-1 CRD reads of the two-phase wedge plus the compact list. JobService
+// depends on this (not the full port) so callers wire only what these tools use,
+// mirroring ClusterReader. The KubeRay adapter satisfies it; the full KubeRayPort
+// satisfies it too.
 type JobReader interface {
+	ListJobs(ctx context.Context, namespace string, opts ListOptions) (JobList, error)
 	GetJob(ctx context.Context, namespace, name string) (JobDetail, error)
 }
 
@@ -72,6 +73,51 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// JobListRequest is the decoded ray_job_list argument set. Namespace is optional
+// (defaults to the service's default namespace); AllNamespaces overrides the
+// namespace scope; Limit/Continue carry the token-economy pagination. Mirrors
+// ClusterListRequest.
+type JobListRequest struct {
+	Namespace     string
+	Limit         int
+	Continue      string
+	AllNamespaces bool
+}
+
+// JobListResult is one page of job summaries plus the honest pagination signal.
+// As with ClusterListResult, k8s list returns no total, so MoreAvailable is
+// derived purely from the presence of a continue token — never a fabricated
+// total. Each row carries BOTH the CRD deployment status and the Ray-side job
+// status (JobSummary).
+type JobListResult struct {
+	Items         []JobSummary
+	Continue      string // k8s continue token for the next page; empty when exhausted.
+	MoreAvailable bool   // true iff Continue != "" — never a fabricated total.
+}
+
+// List applies the namespace default + AllNamespaces scope and passes the
+// pagination options through to the port (the adapter applies the 0→50 cap). It
+// mirrors ClusterService.List: the continue token surfaces unchanged and
+// MoreAvailable is the derived "more available vs showing all" signal.
+func (s *JobService) List(ctx context.Context, req JobListRequest) (JobListResult, error) {
+	namespace := s.resolveNamespace(req.Namespace)
+
+	list, err := s.kube.ListJobs(ctx, namespace, ListOptions{
+		Limit:         req.Limit,
+		Continue:      req.Continue,
+		AllNamespaces: req.AllNamespaces,
+	})
+	if err != nil {
+		return JobListResult{}, err
+	}
+
+	return JobListResult{
+		Items:         list.Items,
+		Continue:      list.Continue,
+		MoreAvailable: list.Continue != "",
+	}, nil
 }
 
 // JobGetRequest is the decoded ray_job_get argument set. Name is required

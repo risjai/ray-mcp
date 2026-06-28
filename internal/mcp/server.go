@@ -18,6 +18,7 @@ import (
 type WriteBackend interface {
 	domain.ClusterBaseBuilder
 	domain.JobBaseBuilder
+	domain.JobGetter
 	domain.Applier
 	domain.Deleter
 }
@@ -66,10 +67,11 @@ func NewServer(cfg *config.Config, src capabilitiesSource, kube domain.ClusterRe
 		writeSvc := domain.NewClusterWriteService(write, kube, write, applySvc, cfg.DefaultNamespace)
 		addClusterWriteTools(server, writeSvc, cfg.AllowRawSpec, cfg.AllowDestructive)
 
-		// RayJob writes (Task 18) share the one apply pipeline (and thus the one
-		// audit sink) with the cluster writes; the adapter is also the JobBaseBuilder.
-		jobWriteSvc := domain.NewJobWriteService(write, applySvc, cfg.DefaultNamespace)
-		addJobWriteTools(server, jobWriteSvc, cfg.AllowRawSpec)
+		// RayJob writes (Task 18/19) share the one apply pipeline (and thus the one
+		// audit sink) with the cluster writes; the adapter is also the JobBaseBuilder,
+		// the JobGetter (mode-aware delete reads the live job), and the Deleter.
+		jobWriteSvc := domain.NewJobWriteService(write, write, write, applySvc, cfg.DefaultNamespace)
+		addJobWriteTools(server, jobWriteSvc, cfg.AllowRawSpec, cfg.AllowDestructive)
 	}
 
 	return server

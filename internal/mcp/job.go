@@ -10,6 +10,41 @@ import (
 	"github.com/risjai/ray-mcp/internal/domain"
 )
 
+// jobListInput is the ray_job_list argument object. All fields are optional; an
+// omitted namespace falls back to the server default, and the pagination fields
+// carry the token economy (spec §10). Mirrors clusterListInput.
+type jobListInput struct {
+	Namespace     string `json:"namespace,omitempty"     jsonschema:"namespace to list RayJobs in; defaults to the server default namespace"`
+	Limit         int    `json:"limit,omitempty"         jsonschema:"max rows per page; 0 uses the server default (~50)"`
+	Continue      string `json:"continue,omitempty"      jsonschema:"opaque continue token from a prior page; omit for the first page"`
+	AllNamespaces bool   `json:"allNamespaces,omitempty" jsonschema:"list across all namespaces instead of one"`
+}
+
+// jobRow is one compact RayJob list row (spec §10: tiny rows — never full
+// status). It surfaces BOTH status fields side by side: the CRD deployment
+// lifecycle (status.jobDeploymentStatus) AND the Ray-side job phase
+// (status.jobStatus), because a RayJob's state is only legible from both — the
+// CRD phase answers "has the operator scheduled/provisioned it" while the Ray
+// phase answers "what is the driver doing".
+type jobRow struct {
+	Name             string `json:"name"`
+	Namespace        string `json:"namespace"`
+	DeploymentStatus string `json:"deploymentStatus" jsonschema:"the CRD lifecycle phase (status.jobDeploymentStatus): Initializing/Running/Complete/Failed/..."`
+	JobStatus        string `json:"jobStatus"        jsonschema:"the Ray driver phase (status.jobStatus): PENDING/RUNNING/SUCCEEDED/FAILED/STOPPED"`
+	AgeSeconds       int64  `json:"ageSeconds"`
+	Health           string `json:"health"`
+}
+
+// JobListOutput is the structured ray_job_list result: the compact rows plus the
+// honest pagination signal. As with clusters there is NO total count — k8s does
+// not return one — so MoreAvailable + Continue is the entire pagination contract.
+type JobListOutput struct {
+	Jobs          []jobRow `json:"jobs"          jsonschema:"the compact RayJob rows for this page"`
+	Count         int      `json:"count"         jsonschema:"the number of rows shown on this page"`
+	MoreAvailable bool     `json:"moreAvailable" jsonschema:"true if more pages exist; pass continue for the next page"`
+	Continue      string   `json:"continue,omitempty" jsonschema:"the continue token for the next page; empty when exhausted"`
+}
+
 // jobGetInput is the ray_job_get argument object. Name is required; namespace
 // defaults to the server default; verbose toggles the full-object escape hatch.
 type jobGetInput struct {
@@ -97,10 +132,31 @@ type JobWaitOutput struct {
 	Health           string `json:"health" jsonschema:"1-line distilled health summary"`
 }
 
-// addJobTools registers ray_job_get, ray_job_logs and ray_job_wait against the
-// domain JobService. All are read-only; the handlers do validation + mapping
-// only, with the two-phase orchestration policy living in the service.
+// addJobTools registers ray_job_list, ray_job_get, ray_job_logs and ray_job_wait
+// against the domain JobService. All are read-only; the handlers do validation +
+// mapping only, with the two-phase orchestration policy living in the service.
 func addJobTools(server *mcp.Server, svc *domain.JobService) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ray_job_list",
+		Description: "List RayJobs as compact rows (name, namespace, deployment status, Ray job status, age, 1-line health), capped and paginated via an opaque continue token. Each row shows BOTH the CRD lifecycle (deploymentStatus) and the Ray driver phase (jobStatus). Read-only.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in jobListInput) (*mcp.CallToolResult, JobListOutput, error) {
+		res, err := svc.List(ctx, domain.JobListRequest{
+			Namespace:     in.Namespace,
+			Limit:         in.Limit,
+			Continue:      in.Continue,
+			AllNamespaces: in.AllNamespaces,
+		})
+		if err != nil {
+			return nil, JobListOutput{}, mapDomainError(err) //nolint:wrapcheck // mapped to a clean, bounded tool error.
+		}
+
+		out := toJobListOutput(res)
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: jobListSummary(in, res)}},
+		}, out, nil
+	})
+
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "ray_job_get",
 		Description: "Get a RayJob's distilled, cross-plane status: the KubeRay CRD lifecycle fused with the LIVE Ray job status dialed from the dashboard once the job is scheduled. Before scheduling it reports 'not yet scheduled' (never a connection error). Pass verbose=true for the full unstructured object. Read-only.",
@@ -177,6 +233,52 @@ func addJobTools(server *mcp.Server, svc *domain.JobService) {
 			Content: []mcp.Content{&mcp.TextContent{Text: jobWaitSummary(out)}},
 		}, out, nil
 	})
+}
+
+// toJobListOutput maps the domain list result to the structured output. Each row
+// carries both status fields verbatim from the summary; this is a CRD-only read
+// (no dashboard dial — list is a cheap, bounded survey, not the two-phase fused
+// view that ray_job_get provides per job).
+func toJobListOutput(res domain.JobListResult) JobListOutput {
+	rows := make([]jobRow, 0, len(res.Items))
+	for _, j := range res.Items {
+		rows = append(rows, jobRow{
+			Name:             j.Name,
+			Namespace:        j.Namespace,
+			DeploymentStatus: j.JobDeploymentStatus,
+			JobStatus:        j.JobStatus,
+			AgeSeconds:       int64(j.Age.Seconds()),
+			Health:           j.Health,
+		})
+	}
+	return JobListOutput{
+		Jobs:          rows,
+		Count:         len(rows),
+		MoreAvailable: res.MoreAvailable,
+		Continue:      res.Continue,
+	}
+}
+
+// jobListSummary renders the one-line human-readable text content. Like the
+// cluster list it is honest about pagination: "more available" only when a
+// continue token is present, "showing all" otherwise — never an implied total
+// k8s did not give.
+func jobListSummary(in jobListInput, res domain.JobListResult) string {
+	scope := fmt.Sprintf("namespace %q", in.Namespace)
+	if in.AllNamespaces {
+		scope = "all namespaces"
+	} else if in.Namespace == "" {
+		scope = "the default namespace"
+	}
+
+	n := len(res.Items)
+	if res.MoreAvailable {
+		return fmt.Sprintf(
+			"%d RayJobs in %s (showing %d; more available — pass continue=%q for the next page)",
+			n, scope, n, res.Continue,
+		)
+	}
+	return fmt.Sprintf("%d RayJobs in %s (showing all %d)", n, scope, n)
 }
 
 // toJobGetOutput maps the domain get result to the structured output. When the

@@ -31,12 +31,13 @@ import (
 )
 
 // newJobWriteService wires the real envtest-backed adapter into the full domain
-// job-write pipeline (JobBaseBuilder + ApplyService), so a submit exercises
-// curated→base→merge→DryRunAll→SSA→diff→audit against a real apiserver.
+// job-write pipeline (JobBaseBuilder + JobGetter + Deleter + ApplyService), so a
+// submit exercises curated→base→merge→DryRunAll→SSA→diff→audit and a delete
+// exercises the mode-aware confirm/cascade path against a real apiserver.
 func newJobWriteService(t *testing.T, adapter *Client) *domain.JobWriteService {
 	t.Helper()
 	apply := domain.NewApplyService(adapter, observability.NewAuditLogger(discardWriter{}))
-	return domain.NewJobWriteService(adapter, apply, "default")
+	return domain.NewJobWriteService(adapter, adapter, adapter, apply, "default")
 }
 
 // getRayJob fetches a RayJob directly (bypassing the adapter) so a test can assert

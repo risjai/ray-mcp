@@ -29,6 +29,20 @@ type fakeWriteBackend struct {
 
 	deleteCalls []deleteRecord
 	deleteErr   error
+
+	// job, when its Name is set, is the live RayJob GetJob returns (so the
+	// mode-aware delete can read its spec/protected/identity); any other name is
+	// NotFound. Zero value → every GetJob is NotFound.
+	job domain.JobDetail
+}
+
+// GetJob satisfies domain.JobGetter so the write backend can serve the mode-aware
+// ray_job_delete read. It returns the seeded job by name, else a NotFoundError.
+func (f *fakeWriteBackend) GetJob(_ context.Context, namespace, name string) (domain.JobDetail, error) {
+	if f.job.Name != "" && f.job.Name == name {
+		return f.job, nil
+	}
+	return domain.JobDetail{}, &domain.NotFoundError{Kind: domain.KindRayJob, Namespace: namespace, Name: name}
 }
 
 type deleteRecord struct {

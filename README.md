@@ -12,8 +12,10 @@ Read-only today; a guarded write path is on the way (see below).
 > (`ray_cluster_list` / `ray_cluster_get` / `ray_cluster_events`), the full
 > guarded RayCluster write path (`create` / `update` / `scale` / `delete`), the
 > read-only RayJob wedge (`ray_job_get` / `ray_job_logs` / `ray_job_wait` — CRD
-> status fused with the live Ray dashboard/job API), and non-blocking RayJob submit
-> (`ray_job_submit`), over stdio. The remaining Ray job/service tools land next.
+> status fused with the live Ray dashboard/job API), and the RayJob write/list path
+> (`ray_job_submit` / `ray_job_list` / `ray_job_delete` — delete is mode-aware:
+> deleting an ephemeral job cascades to its cluster, so that path is destructive),
+> over stdio. The remaining Ray service tools land next.
 
 ## Why ray-mcp
 
@@ -140,7 +142,8 @@ Needs Docker + kubectl + Go + Claude Code; ~20–30 min; fully disposable.
 | RayJob read — `ray_job_get` / `ray_job_logs` (two-phase wedge: CRD + live dashboard) | ✅ Shipped |
 | RayJob wait — `ray_job_wait` (bounded ≤30s, `until=running\|terminal`, two-phase) | ✅ Shipped |
 | RayJob submit — `ray_job_submit` (non-blocking, existingCluster XOR ephemeral clusterSpec, dry-run, diffs) | ✅ Shipped (`--allow-mutations`) |
-| RayJob tools — list / delete (mode-aware) | 📋 Planned |
+| RayJob list — `ray_job_list` (both statuses per row: CRD lifecycle + Ray phase) | ✅ Shipped |
+| RayJob delete — `ray_job_delete` (mode-aware: ephemeral cascade is destructive + confirm-fingerprint, existing-cluster is a plain write, `protected` guard) | ✅ Shipped (`--allow-mutations`) |
 | RayService tools — deploy / update / list / get / delete | 📋 Planned |
 | Streamable HTTP transport + auth (static bearer / TokenReview) | 📋 Planned |
 | Read-only RBAC floor — ServiceAccount + ClusterRole ([`deploy/rbac/`](deploy/rbac/)) | ✅ Shipped (read-only) |

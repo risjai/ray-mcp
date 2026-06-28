@@ -190,3 +190,108 @@ func TestGetJobNotFound(t *testing.T) {
 		t.Errorf("NotFoundError.Name = %q, want %q", nf.Name, "no-such-job")
 	}
 }
+
+// TestListJobsRowCarriesBothStatuses creates a RayJob, writes a status with BOTH
+// the Ray-side phase (jobStatus) and the CRD lifecycle (jobDeploymentStatus), and
+// asserts the list row surfaces both side by side — the spec's headline ray_job_list
+// requirement, proven end-to-end against a real apiserver.
+func TestListJobsRowCarriesBothStatuses(t *testing.T) {
+	adapter, k8s := startAdapter(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const (
+		namespace = "default"
+		name      = "list-job-one"
+	)
+
+	rj := newRayJob(namespace, name)
+	if err := k8s.Create(ctx, rj); err != nil {
+		t.Fatalf("create RayJob: %v", err)
+	}
+	rj.Status = rayv1.RayJobStatus{
+		JobStatus:           rayv1.JobStatusRunning,
+		JobDeploymentStatus: rayv1.JobDeploymentStatusRunning,
+	}
+	if err := k8s.Status().Update(ctx, rj); err != nil {
+		t.Fatalf("status subresource update: %v", err)
+	}
+
+	list, err := adapter.ListJobs(ctx, namespace, domain.ListOptions{})
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+
+	got := findJobSummary(list.Items, name)
+	if got == nil {
+		t.Fatalf("ListJobs did not return %q; items = %+v", name, list.Items)
+	}
+	if got.JobStatus != "RUNNING" {
+		t.Errorf("summary JobStatus = %q, want RUNNING (Ray-side phase)", got.JobStatus)
+	}
+	if got.JobDeploymentStatus != "Running" {
+		t.Errorf("summary JobDeploymentStatus = %q, want Running (CRD lifecycle)", got.JobDeploymentStatus)
+	}
+}
+
+// TestListJobsPagination creates three RayJobs, lists with Limit=1, and follows
+// the continue token, asserting the k8s token surfaces verbatim and paging walks
+// the full set without silent truncation — mirrors TestListClustersPagination.
+func TestListJobsPagination(t *testing.T) {
+	adapter, k8s := startAdapter(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const namespace = "default"
+	names := []string{"job-page-a", "job-page-b", "job-page-c"}
+	for _, name := range names {
+		if err := k8s.Create(ctx, newRayJob(namespace, name)); err != nil {
+			t.Fatalf("create %q: %v", name, err)
+		}
+	}
+
+	seen := map[string]bool{}
+	cont := ""
+	pages := 0
+	for {
+		list, err := adapter.ListJobs(ctx, namespace, domain.ListOptions{Limit: 1, Continue: cont})
+		if err != nil {
+			t.Fatalf("ListJobs (continue=%q): %v", cont, err)
+		}
+		if len(list.Items) != 1 {
+			t.Fatalf("page %d returned %d items, want exactly 1 (Limit=1)", pages, len(list.Items))
+		}
+		seen[list.Items[0].Name] = true
+		pages++
+
+		if list.Continue == "" {
+			break
+		}
+		cont = list.Continue
+
+		if pages > len(names)+1 {
+			t.Fatalf("pagination did not terminate after %d pages", pages)
+		}
+	}
+
+	if pages != len(names) {
+		t.Errorf("walked %d pages, want %d (one per job)", pages, len(names))
+	}
+	for _, name := range names {
+		if !seen[name] {
+			t.Errorf("job %q never appeared across paged listing", name)
+		}
+	}
+}
+
+// findJobSummary returns the summary with the given name, or nil.
+func findJobSummary(items []domain.JobSummary, name string) *domain.JobSummary {
+	for i := range items {
+		if items[i].Name == name {
+			return &items[i]
+		}
+	}
+	return nil
+}

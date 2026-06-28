@@ -48,13 +48,16 @@ type ClusterDetail struct {
 	Raw             MergedSpec // full object, surfaced only under verbose/raw.
 }
 
-// JobSummary is the compact list row for a RayJob.
+// JobSummary is the compact list row for a RayJob. It carries BOTH status
+// fields ray_job_list surfaces side by side: the CRD-side lifecycle
+// (jobDeploymentStatus) and the Ray-side phase (jobStatus).
 type JobSummary struct {
-	Name      string
-	Namespace string
-	JobStatus string // status.jobStatus (Ray-side phase).
-	Age       time.Duration
-	Health    string // 1-line health summary.
+	Name                string
+	Namespace           string
+	JobStatus           string // status.jobStatus (Ray-side phase).
+	JobDeploymentStatus string // status.jobDeploymentStatus (CRD-side lifecycle).
+	Age                 time.Duration
+	Health              string // 1-line health summary.
 }
 
 // JobDetail is the distilled get view for a RayJob. It bridges the k8s name to
@@ -63,11 +66,10 @@ type JobSummary struct {
 type JobDetail struct {
 	JobSummary
 
-	JobID               string // status.jobId — the submission id (raysubmit_...).
-	DashboardURL        string // status.dashboardURL.
-	JobDeploymentStatus string // status.jobDeploymentStatus (CRD-side lifecycle).
-	RayClusterName      string // status.rayClusterName — head service resolution.
-	Raw                 MergedSpec
+	JobID          string // status.jobId — the submission id (raysubmit_...).
+	DashboardURL   string // status.dashboardURL.
+	RayClusterName string // status.rayClusterName — head service resolution.
+	Raw            MergedSpec
 }
 
 // ServiceSummary is the compact list row for a RayService.

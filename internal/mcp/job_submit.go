@@ -70,7 +70,7 @@ type JobSubmitOutput struct {
 // whether the rawSpec arg appears in the advertised schema: when false the
 // power-user escape hatch is removed entirely (Gate 1 C3 hard mode), with a
 // defense-in-depth runtime reject for clients that ignore the pruned schema.
-func addJobWriteTools(server *mcp.Server, svc *domain.JobWriteService, allowRawSpec bool) {
+func addJobWriteTools(server *mcp.Server, svc *domain.JobWriteService, allowRawSpec, allowDestructive bool) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "ray_job_submit",
 		Description: "Submit a RayJob (non-blocking) against EXACTLY ONE cluster target: existingCluster (run on a running RayCluster) XOR clusterSpec (create an ephemeral cluster for the job, torn down on finish by default — pass shutdownAfterJobFinishes=false to keep it). Supplying both or neither is an error. Always server-side validated first; pass dryRun=true to validate without submitting. Returns immediately with the field-level diff and the just-submitted status (jobId/deploymentStatus are usually empty until the controller reconciles — follow with ray_job_get/ray_job_wait). Requires --allow-mutations.",
@@ -99,6 +99,11 @@ func addJobWriteTools(server *mcp.Server, svc *domain.JobWriteService, allowRawS
 			Content: []mcp.Content{&mcp.TextContent{Text: jobSubmitSummary(out)}},
 		}, out, nil
 	})
+
+	// ray_job_delete registers alongside submit (under --allow-mutations): an
+	// existing-cluster delete is a plain write. The ephemeral cascade is gated at
+	// runtime by allowDestructive (Q16a), not at registration.
+	addJobDeleteTool(server, svc, allowDestructive)
 }
 
 // jobSubmitInputSchema returns the advertised input schema for ray_job_submit.
