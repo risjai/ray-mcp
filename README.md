@@ -4,9 +4,11 @@
 any MCP client) at your cluster and ask about your Ray workloads in plain language.
 Read-only today; a guarded write path is on the way (see below).
 
+[![CI](https://github.com/risjai/ray-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/risjai/ray-mcp/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![Go](https://img.shields.io/badge/go-1.26.3-00ADD8)
 ![Status](https://img.shields.io/badge/status-v0.1.0%20preview-orange)
+[![Stars](https://img.shields.io/github/stars/risjai/ray-mcp?style=flat&color=2f81f7)](https://github.com/risjai/ray-mcp/stargazers)
 
 > **Status: v0.1.0 preview.** Today: `ray_capabilities`, the RayCluster read tools
 > (`ray_cluster_list` / `ray_cluster_get` / `ray_cluster_events`), the full
@@ -15,9 +17,11 @@ Read-only today; a guarded write path is on the way (see below).
 > status fused with the live Ray dashboard/job API), and the RayJob write/list path
 > (`ray_job_submit` / `ray_job_list` / `ray_job_delete` — delete is mode-aware:
 > deleting an ephemeral job cascades to its cluster, so that path is destructive),
-> and the read-only RayService tools (`ray_service_list` / `ray_service_get` —
-> distilled rollout phase + serve health), over stdio. The RayService write path
-> (deploy / update / delete) lands next.
+> the read-only RayService tools (`ray_service_list` / `ray_service_get` —
+> distilled rollout phase + serve health), and the RayService write tools
+> (`ray_service_deploy` / `ray_service_update` — update predicts the operator's
+> reconfig path: in-place serve reconfig, zero-downtime cluster swap, or scale),
+> over stdio. RayService `delete` lands next.
 
 ## Why ray-mcp
 
@@ -47,8 +51,8 @@ YAML. ray-mcp is built specifically for Ray, with the LLM as the consumer.
 - **The wedge** — a read-only reach into Ray's dashboard/job API for live job
   status and logs, the runtime detail the CRDs don't hold (this is where the
   distillation above extends to jobs: *"why is my job pending?"*).
-- **RayService write tools** — deploy / update / delete for RayService, layered on
-  the guarded write path below (the RayService read tools already ship).
+- **RayService `delete`** — the last RayService write op, layered on the guarded
+  write path below (deploy / update already ship; the read tools too).
 
 ## Install
 
@@ -147,7 +151,8 @@ Needs Docker + kubectl + Go + Claude Code; ~20–30 min; fully disposable.
 | RayJob list — `ray_job_list` (both statuses per row: CRD lifecycle + Ray phase) | ✅ Shipped |
 | RayJob delete — `ray_job_delete` (mode-aware: ephemeral cascade is destructive + confirm-fingerprint, existing-cluster is a plain write, `protected` guard) | ✅ Shipped (`--allow-mutations`) |
 | RayService read — `ray_service_list` / `ray_service_get` (distilled rollout phase + serve health) | ✅ Shipped |
-| RayService writes — deploy / update / delete | 📋 Planned |
+| RayService writes — `ray_service_deploy` / `ray_service_update` (SSA, dry-run, diffs; update predicts the operator's reconfig path: in-place / zero-downtime-swap / scale) | ✅ Shipped (`--allow-mutations`) |
+| RayService delete | 📋 Planned |
 | Streamable HTTP transport + auth (static bearer / TokenReview) | 📋 Planned |
 | Read-only RBAC floor — ServiceAccount + ClusterRole ([`deploy/rbac/`](deploy/rbac/)) | ✅ Shipped (read-only) |
 | Helm chart + in-cluster Deployment | 📋 Planned |

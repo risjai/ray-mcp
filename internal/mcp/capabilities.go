@@ -60,6 +60,15 @@ var curatedClusterFields = []string{
 	"enableAutoscaling", "labels", "annotations", "rawSpec",
 }
 
+// curatedServiceFields is the static curated field set for RayService deploy/update
+// (Task 21, Gate 1 C3 "curated params stay thin").
+var curatedServiceFields = []string{
+	"name", "namespace", "serveConfigV2", "rayVersion", "image",
+	"headResources{cpu,memory,gpu}",
+	"workerGroups[]{name,replicas,minReplicas,maxReplicas,resources}",
+	"enableAutoscaling", "labels", "annotations", "rawSpec",
+}
+
 // enabledTiers derives the enabled tool tiers from config. It is pure (no I/O)
 // so it can be unit-tested directly. The read tier is always on; write requires
 // --allow-mutations; destructive ADDITIONALLY requires --allow-mutations (spec §6:
@@ -103,7 +112,10 @@ func addCapabilitiesTool(server *mcp.Server, cfg *config.Config, src capabilitie
 			FieldValidation: fieldValidation{
 				Mode:             "server-side-dry-run",
 				PruningDetection: true,
-				CuratedFields:    map[string][]string{"RayCluster": curatedClusterFields},
+				CuratedFields: map[string][]string{
+					"RayCluster": curatedClusterFields,
+					"RayService": curatedServiceFields,
+				},
 			},
 		}
 		// Set Content explicitly to a short summary; if left unset, the SDK
