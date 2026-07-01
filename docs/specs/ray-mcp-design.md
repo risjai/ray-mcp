@@ -70,13 +70,18 @@ KubeRay specs are exactly where agents fail:
 
 - **Typed worker-group autoscaling** (min/max/replicas per group) as first-class
   params, not hand-built spec paths.
-- **RayService reconfig awareness.** KubeRay has *two distinct* update paths and
-  an agent must not confuse them: editing `serveConfigV2` is an **in-place** update
-  to Serve apps on the existing cluster, whereas editing the cluster config (e.g.
-  `rayVersion`) triggers a **zero-downtime cluster swap** (KubeRay stands up a
-  pending cluster, waits, switches head-service traffic, deletes the old one).
-  `ray-mcp` knows which path a given change takes and reports it; a generic tool
-  patching raw YAML does not.
+- **RayService reconfig awareness.** KubeRay v1.6.1 has *three* update outcomes
+  and an agent must not confuse them: editing `serveConfigV2` alone is an
+  **in-place** Serve reconfig on the existing cluster; editing the cluster config
+  (e.g. `rayVersion`, `image`) triggers a **zero-downtime cluster swap** (KubeRay
+  stands up a pending cluster, waits, switches head-service traffic, deletes the
+  old one) — IF `upgradeStrategy.type` is set or the operator's
+  `ENABLE_ZERO_DOWNTIME` env defaults to true; changing ONLY replica-class fields
+  (replicas, min/maxReplicas, tolerations, schedulingGates) is a **scale with no
+  swap** since those fields are excluded from the cluster-config hash.
+  `ray-mcp` replicates the operator's hash-exclusion logic (the "faithful
+  predictor") and reports the predicted path; a generic tool patching raw YAML
+  does not.
 - **Pre-apply pruning prediction (Q4).** Structural-schema CRDs make the K8s API
   server **silently prune fields the installed CRD schema doesn't know** — no
   error; the agent thinks it worked. Because `ray-mcp` reads the installed Ray CRD
@@ -764,8 +769,11 @@ the SDK repo. Confirmed:
 - **Autoscaler writes `replicas`** (and `workersToDelete`) on the RayCluster CR →
   the lost-update risk in §7.D is real, and SSA field-ownership is the mitigation.
   (No doc *recommendation* against manual edits is claimed — only the mechanism.)
-- **RayService:** `serveConfigV2` change = **in-place** Serve update; cluster-config
-  change = **zero-downtime cluster swap**. Two different paths (§2, §6).
+- **RayService:** three update outcomes — `serveConfigV2`-only change =
+  **in-place** Serve update; cluster-config change = **zero-downtime cluster swap**
+  (gated by `upgradeStrategy.type` / operator `ENABLE_ZERO_DOWNTIME` env);
+  replica-class-only change (replicas, min/max, tolerations, schedulingGates) =
+  **scale with no swap** (fields excluded from the cluster-config hash).
 - **Structural-schema pruning (Q4):** the K8s API server silently prunes unknown
   fields against the installed CRD schema — the basis for reading the Ray CRD
   schema to predict pruning before applying.

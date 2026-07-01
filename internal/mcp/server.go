@@ -9,15 +9,16 @@ import (
 )
 
 // WriteBackend is the write slice NewServer needs to register the mutating tools:
-// the curated→base builders for RayCluster (spec §7.C step 1) and RayJob (Task 18),
-// the shared SSA Applier (Task 8b), and the Deleter (Task 12, destructive tier).
-// The KubeRay adapter satisfies all of them; they are bundled into one narrow
-// interface so NewServer takes a single backend handle (the adapter) rather than a
-// growing parameter list, and tests can inject a fake. It is only consulted when
-// cfg.AllowMutations is set.
+// the curated→base builders for RayCluster (spec §7.C step 1), RayJob (Task 18),
+// and RayService (Task 21), the shared SSA Applier (Task 8b), and the Deleter
+// (Task 12, destructive tier). The KubeRay adapter satisfies all of them; they are
+// bundled into one narrow interface so NewServer takes a single backend handle (the
+// adapter) rather than a growing parameter list, and tests can inject a fake. It is
+// only consulted when cfg.AllowMutations is set.
 type WriteBackend interface {
 	domain.ClusterBaseBuilder
 	domain.JobBaseBuilder
+	domain.ServiceBaseBuilder
 	domain.JobGetter
 	domain.Applier
 	domain.Deleter
@@ -80,6 +81,15 @@ func NewServer(cfg *config.Config, src capabilitiesSource, kube domain.ClusterRe
 		// the JobGetter (mode-aware delete reads the live job), and the Deleter.
 		jobWriteSvc := domain.NewJobWriteService(write, write, write, applySvc, cfg.DefaultNamespace)
 		addJobWriteTools(server, jobWriteSvc, cfg.AllowRawSpec, cfg.AllowDestructive)
+
+		// RayService writes (Task 21): deploy + update. The adapter is also the
+		// ServiceBaseBuilder; the ServiceGetter (for update's read-modify-apply, the
+		// narrow read slice that path needs) is satisfied by the read backend (kube)
+		// when it implements it — same "advertise only when wired" gate as the reads.
+		if svcGetter, ok := kube.(domain.ServiceGetter); ok {
+			svcWriteSvc := domain.NewServiceWriteService(write, svcGetter, applySvc, cfg.DefaultNamespace)
+			addServiceWriteTools(server, svcWriteSvc, cfg.AllowRawSpec)
+		}
 	}
 
 	return server

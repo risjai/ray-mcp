@@ -78,6 +78,24 @@ func (f *fakeWriteBackend) BuildClusterBase(p domain.ClusterCreateParams) (domai
 	}, nil
 }
 
+// BuildServiceBase builds a minimal identity-carrying RayService base for the MCP
+// service write tests. It carries the identity and a minimal spec with
+// rayClusterConfig so the tool can drive deploy end-to-end.
+func (f *fakeWriteBackend) BuildServiceBase(p domain.ServiceDeployParams) (domain.MergedSpec, error) {
+	spec := map[string]any{
+		"rayClusterConfig": map[string]any{"rayVersion": p.RayVersion},
+	}
+	if p.ServeConfigV2 != "" {
+		spec["serveConfigV2"] = p.ServeConfigV2
+	}
+	return domain.MergedSpec{
+		"apiVersion": "ray.io/v1",
+		"kind":       "RayService",
+		"metadata":   map[string]any{"name": p.Name, "namespace": p.Namespace},
+		"spec":       spec,
+	}, nil
+}
+
 // BuildJobBase builds a minimal identity-carrying RayJob base mirroring the real
 // adapter's mode mapping (clusterSelector vs rayClusterSpec) so the MCP submit
 // tests can drive both modes through the in-memory client. By the time this is
