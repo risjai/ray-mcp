@@ -15,6 +15,7 @@ package kuberay
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -34,7 +35,8 @@ import (
 func newServiceWriteService(t *testing.T, adapter *Client) *domain.ServiceWriteService {
 	t.Helper()
 	apply := domain.NewApplyService(adapter, observability.NewAuditLogger(discardWriter{}))
-	return domain.NewServiceWriteService(adapter, adapter, apply, "default")
+	// The adapter is also the Deleter (kind-generic Delete) for the destructive tier.
+	return domain.NewServiceWriteService(adapter, adapter, adapter, apply, "default")
 }
 
 // getRayService fetches a RayService directly (bypassing the adapter) so a test can
@@ -173,6 +175,91 @@ func TestServiceUpdateServeConfigInPlace(t *testing.T) {
 	}
 	if rs.Spec.ServeConfigV2 != "new-serve-config" {
 		t.Errorf("persisted serveConfigV2 = %q, want new-serve-config", rs.Spec.ServeConfigV2)
+	}
+}
+
+// TestServiceDeleteTwoStep is the delete AC against a real apiserver: a preview
+// (no confirm) leaves the service in place and yields a fingerprint; the matching
+// confirm removes it. There is no operator here, so .status.numServeEndpoints is
+// never set — the serving guard does not trigger, exercising the plain confirm path.
+func TestServiceDeleteTwoStep(t *testing.T) {
+	adapter, k8s := startAdapter(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	svc := newServiceWriteService(t, adapter)
+	const namespace, name = "default", "delete-svc"
+
+	if _, err := svc.Deploy(ctx, domain.ServiceDeployParams{
+		Namespace:     namespace,
+		Name:          name,
+		RayVersion:    "2.9.0",
+		Image:         "rayproject/ray:2.9.0",
+		HeadResources: domain.ResourceQuantities{CPU: "1", Memory: "2Gi"},
+		WorkerGroups: []domain.WorkerGroupParams{{
+			Name: "workers", Replicas: 1, MinReplicas: 0, MaxReplicas: 5,
+			Resources: domain.ResourceQuantities{CPU: "500m", Memory: "1Gi"},
+		}},
+	}); err != nil {
+		t.Fatalf("initial Deploy: %v", err)
+	}
+
+	// Preview: no confirm → ConfirmRequiredError, service still present.
+	err := svc.Delete(ctx, domain.ServiceDeleteParams{Namespace: namespace, Name: name})
+	var required *domain.ConfirmRequiredError
+	if !errors.As(err, &required) {
+		t.Fatalf("Delete(preview) error = %v, want *ConfirmRequiredError", err)
+	}
+	if _, getErr := getRayService(ctx, t, k8s, namespace, name); getErr != nil {
+		t.Fatalf("service gone after preview (get err = %v), want still present", getErr)
+	}
+
+	// Commit: echo the fingerprint → deleted.
+	if err := svc.Delete(ctx, domain.ServiceDeleteParams{
+		Namespace: namespace, Name: name, Confirm: required.Fingerprint,
+	}); err != nil {
+		t.Fatalf("Delete(commit): %v", err)
+	}
+	if _, getErr := getRayService(ctx, t, k8s, namespace, name); !apierrors.IsNotFound(getErr) {
+		t.Fatalf("service still present after commit (get err = %v), want NotFound", getErr)
+	}
+}
+
+// TestServiceDeleteProtectedRefused asserts a service carrying ray-mcp/protected=true
+// refuses deletion even with a would-be-valid confirm, and stays present.
+func TestServiceDeleteProtectedRefused(t *testing.T) {
+	adapter, k8s := startAdapter(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	svc := newServiceWriteService(t, adapter)
+	const namespace, name = "default", "protected-svc"
+
+	if _, err := svc.Deploy(ctx, domain.ServiceDeployParams{
+		Namespace:     namespace,
+		Name:          name,
+		RayVersion:    "2.9.0",
+		Image:         "rayproject/ray:2.9.0",
+		HeadResources: domain.ResourceQuantities{CPU: "1", Memory: "2Gi"},
+		Annotations:   map[string]string{domain.ProtectedAnnotation: "true"},
+		WorkerGroups: []domain.WorkerGroupParams{{
+			Name: "workers", Replicas: 1, MinReplicas: 0, MaxReplicas: 5,
+			Resources: domain.ResourceQuantities{CPU: "500m", Memory: "1Gi"},
+		}},
+	}); err != nil {
+		t.Fatalf("initial Deploy: %v", err)
+	}
+
+	err := svc.Delete(ctx, domain.ServiceDeleteParams{Namespace: namespace, Name: name})
+	if err == nil {
+		t.Fatal("Delete on protected service returned nil, want refusal")
+	}
+	var required *domain.ConfirmRequiredError
+	if errors.As(err, &required) {
+		t.Fatal("protected service yielded a fingerprint; the protected check must precede confirm")
+	}
+	if _, getErr := getRayService(ctx, t, k8s, namespace, name); getErr != nil {
+		t.Fatalf("protected service gone (get err = %v), want still present", getErr)
 	}
 }
 

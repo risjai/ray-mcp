@@ -63,11 +63,14 @@ type ServiceUpdateOutput struct {
 	Diff          []fieldChangeOutput `json:"diff"           jsonschema:"the field-level diff of the submitted intent vs the server's view"`
 }
 
-// addServiceWriteTools registers the mutating RayService tools (deploy, update)
-// against the domain ServiceWriteService. Called by NewServer ONLY when
-// --allow-mutations is set (spec §6). allowRawSpec gates the rawSpec arg in the
-// advertised schema.
-func addServiceWriteTools(server *mcp.Server, svc *domain.ServiceWriteService, allowRawSpec bool) {
+// addServiceWriteTools registers the mutating RayService tools (deploy, update,
+// and — under the destructive tier — delete) against the domain
+// ServiceWriteService. Called by NewServer ONLY when --allow-mutations is set
+// (spec §6). allowRawSpec gates the rawSpec arg in the advertised schema.
+// allowDestructive gates ray_service_delete: deleting a RayService always cascades
+// to its owned cluster(s), so — like ray_cluster_delete — the tool is absent unless
+// the destructive tier is enabled.
+func addServiceWriteTools(server *mcp.Server, svc *domain.ServiceWriteService, allowRawSpec, allowDestructive bool) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "ray_service_deploy",
 		Description: "Deploy a RayService from curated params (serveConfigV2, rayVersion, image, head/worker resources, worker groups, autoscaling) with an optional rawSpec escape hatch merged over them. The embedded cluster config uses the rayClusterConfig key. Always server-side validated first; pass dryRun=true to validate without deploying. Returns the field-level diff. Requires --allow-mutations.",
@@ -126,6 +129,117 @@ func addServiceWriteTools(server *mcp.Server, svc *domain.ServiceWriteService, a
 			Content: []mcp.Content{&mcp.TextContent{Text: serviceUpdateSummary(out)}},
 		}, out, nil
 	})
+
+	if allowDestructive {
+		addServiceDeleteTool(server, svc)
+	}
+}
+
+// serviceDeleteInput is the ray_service_delete argument object: identity, the
+// confirm fingerprint (empty for preview, echoed back to commit), force (override
+// the serving-traffic guard), and dryRun.
+type serviceDeleteInput struct {
+	Name      string `json:"name"                jsonschema:"the RayService name (required)"`
+	Namespace string `json:"namespace,omitempty" jsonschema:"namespace of the RayService; defaults to the server default namespace"`
+	Confirm   string `json:"confirm,omitempty"   jsonschema:"confirmation fingerprint from a prior preview (empty call); echo it back to commit the deletion"`
+	Force     bool   `json:"force,omitempty"     jsonschema:"override the guard that refuses to delete a RayService that appears to be serving traffic; confirm is still required"`
+	DryRun    bool   `json:"dryRun,omitempty"    jsonschema:"validate the deletion server-side without removing anything"`
+}
+
+// ServiceDeleteOutput is the unified structured result for ray_service_delete:
+// preview calls carry Confirm + Message (the fingerprint to echo); commit calls
+// carry DryRun. Confirm is non-empty only on a preview; DryRun is meaningful only
+// on a commit — mirrors ClusterDeleteOutput.
+type ServiceDeleteOutput struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+	DryRun    bool   `json:"dryRun,omitempty"  jsonschema:"true if nothing was deleted (a server-side validation only)"`
+	Confirm   string `json:"confirm,omitempty" jsonschema:"echo this fingerprint back to commit the deletion (preview only)"`
+	Message   string `json:"message,omitempty" jsonschema:"human-readable explanation of the preview or result"`
+}
+
+// addServiceDeleteTool registers ray_service_delete. Deleting a RayService cascades
+// to its owned RayCluster(s) and every serve replica/actor on them, so it is
+// destructive and registered ONLY when --allow-destructive is set (tool absent
+// otherwise — spec §6). Beyond the protected annotation and the two-step confirm
+// fingerprint (shared with the other deletes), it adds the Gate 4 serving-traffic
+// guard: a service that appears to be serving is refused unless force=true (the
+// override still requires confirm). It is idempotent (a re-delete of a gone service
+// is NotFound; a re-commit of the same fingerprint is safe).
+func addServiceDeleteTool(server *mcp.Server, svc *domain.ServiceWriteService) {
+	destructive := true
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "ray_service_delete",
+		Description: "Delete a RayService (two-step confirmed): call WITHOUT confirm to preview and " +
+			"receive a confirmation fingerprint, then re-call with confirm=<fingerprint> to delete. " +
+			"Deleting a RayService cascades to its owned RayCluster(s) and every serve replica on them. " +
+			"If the service appears to be serving traffic (ready serve endpoints, or an upgrade/rollback " +
+			"in progress) the deletion is refused unless force=true (a guardrail against deleting a live " +
+			"service; confirm is still required). Honors the ray-mcp/protected annotation (refuses). " +
+			"Requires --allow-destructive. Pass dryRun=true to validate without deleting.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive, IdempotentHint: true},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in serviceDeleteInput) (*mcp.CallToolResult, ServiceDeleteOutput, error) {
+		if in.Name == "" {
+			return nil, ServiceDeleteOutput{}, errors.New("name is required")
+		}
+
+		err := svc.Delete(ctx, domain.ServiceDeleteParams{
+			Namespace: in.Namespace,
+			Name:      in.Name,
+			Confirm:   in.Confirm,
+			Force:     in.Force,
+			DryRun:    in.DryRun,
+		})
+
+		// Preview: the domain returns a ConfirmRequiredError carrying the fingerprint.
+		// A SUCCESSFUL preview (not a tool error): return nil error with the
+		// fingerprint in the structured output so the agent can echo it back.
+		var required *domain.ConfirmRequiredError
+		if errors.As(err, &required) {
+			ns := serviceResolvedNamespace(in.Namespace, svc)
+			out := ServiceDeleteOutput{
+				Name:      in.Name,
+				Namespace: ns,
+				Confirm:   required.Fingerprint,
+				Message: fmt.Sprintf(
+					"RayService %q will be deleted (cascades to its owned cluster(s) and serve replicas). "+
+						"Re-issue with confirm=%q to commit.", in.Name, required.Fingerprint),
+			}
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: out.Message}},
+			}, out, nil
+		}
+
+		if err != nil {
+			return nil, ServiceDeleteOutput{}, mapDomainError(err) //nolint:wrapcheck // mapped to a clean, bounded tool error.
+		}
+
+		// Commit succeeded (or dry-run validated).
+		ns := serviceResolvedNamespace(in.Namespace, svc)
+		verb := "deleted"
+		if in.DryRun {
+			verb = "validated (dry-run, not deleted)"
+		}
+		out := ServiceDeleteOutput{
+			Name:      in.Name,
+			Namespace: ns,
+			DryRun:    in.DryRun,
+			Message:   fmt.Sprintf("RayService %q %s", in.Name, verb),
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: out.Message}},
+		}, out, nil
+	})
+}
+
+// serviceResolvedNamespace echoes the namespace the delete targeted, applying the
+// same default fallback the service uses so the result is never blank when the
+// caller omitted one (mirrors jobResolvedNamespace).
+func serviceResolvedNamespace(ns string, svc *domain.ServiceWriteService) string {
+	if ns != "" {
+		return ns
+	}
+	return svc.DefaultNamespace()
 }
 
 func serviceDeployInputSchema(allowRawSpec bool) any {
