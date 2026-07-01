@@ -19,9 +19,10 @@ Read-only today; a guarded write path is on the way (see below).
 > deleting an ephemeral job cascades to its cluster, so that path is destructive),
 > the read-only RayService tools (`ray_service_list` / `ray_service_get` —
 > distilled rollout phase + serve health), and the RayService write tools
-> (`ray_service_deploy` / `ray_service_update` — update predicts the operator's
-> reconfig path: in-place serve reconfig, zero-downtime cluster swap, or scale),
-> over stdio. RayService `delete` lands next.
+> (`ray_service_deploy` / `ray_service_update` / `ray_service_delete` — update
+> predicts the operator's reconfig path: in-place serve reconfig, zero-downtime
+> cluster swap, or scale; delete is destructive-tier, refuses a service that
+> appears to be serving traffic unless forced), over stdio.
 
 ## Why ray-mcp
 
@@ -152,7 +153,7 @@ Needs Docker + kubectl + Go + Claude Code; ~20–30 min; fully disposable.
 | RayJob delete — `ray_job_delete` (mode-aware: ephemeral cascade is destructive + confirm-fingerprint, existing-cluster is a plain write, `protected` guard) | ✅ Shipped (`--allow-mutations`) |
 | RayService read — `ray_service_list` / `ray_service_get` (distilled rollout phase + serve health) | ✅ Shipped |
 | RayService writes — `ray_service_deploy` / `ray_service_update` (SSA, dry-run, diffs; update predicts the operator's reconfig path: in-place / zero-downtime-swap / scale) | ✅ Shipped (`--allow-mutations`) |
-| RayService delete | 📋 Planned |
+| RayService delete — `ray_service_delete` (destructive tier, two-step confirm-fingerprint, `protected` guard, refuses a serving service unless `force=true`; always cascades to the owned cluster) | ✅ Shipped (`--allow-destructive`) |
 | Streamable HTTP transport + auth (static bearer / TokenReview) | 📋 Planned |
 | Read-only RBAC floor — ServiceAccount + ClusterRole ([`deploy/rbac/`](deploy/rbac/)) | ✅ Shipped (read-only) |
 | Helm chart + in-cluster Deployment | 📋 Planned |

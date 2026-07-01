@@ -75,6 +75,24 @@ func (e *ConfirmRequiredError) Error() string {
 	return fmt.Sprintf("%s requires confirmation: re-issue with confirm=%q (recomputed from the live object; a stale value is rejected)", e.Operation, e.Fingerprint)
 }
 
+// ServingRefusedError reports that a destructive op was refused because the target
+// appears to be serving traffic and the caller did not pass force (Decision Gate 4).
+// It carries the human-readable reason (the serving signal detected) so the tool
+// layer can render an honest impact message and point at the force override. It is
+// a distinct typed error (not a ConfirmRequiredError): no fingerprint is minted
+// until the caller opts in with force, so a serving service cannot be confirmed by
+// accident. The claim is "serving-CAPABLE" — the CRD exposes no live-load metric.
+type ServingRefusedError struct {
+	Name   string
+	Reason string
+}
+
+func (e *ServingRefusedError) Error() string {
+	return fmt.Sprintf(
+		"deletion refused: RayService %q appears to be serving traffic (%s); re-issue with force=true to override (this is a guardrail against accidental deletion, not a security control)",
+		e.Name, e.Reason)
+}
+
 // ConfirmMismatchError reports a non-empty confirm that does not match the
 // recomputed fingerprint — either a wrong value or a STALE one (the resource
 // changed since the preview, flipping a resourceVersion-bound fingerprint). It

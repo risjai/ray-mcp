@@ -319,7 +319,19 @@ func serviceBaseFor(namespace, name string) MergedSpec {
 
 func newServiceWriteService(base ServiceBaseBuilder, get ServiceGetter, applier Applier, defaultNS string) (*ServiceWriteService, *recordingSink) {
 	sink := &recordingSink{}
-	svc := NewServiceWriteService(base, get, NewApplyService(applier, sink), defaultNS)
+	// Deploy/update tests never delete; a throwaway deleter satisfies the port.
+	svc := NewServiceWriteService(base, get, &fakeDeleter{}, NewApplyService(applier, sink), defaultNS)
+	return svc, sink
+}
+
+// newServiceDeleteService wires a ServiceWriteService with a seeded fake getter (so
+// GetService returns the given detail) and a recording audit sink, for the delete
+// tests. Mirrors newDeleteService on the cluster side.
+func newServiceDeleteService(detail ServiceDetail, deleter *fakeDeleter) (*ServiceWriteService, *recordingSink) {
+	getter := &fakeServiceGetter{detail: detail}
+	sink := &recordingSink{}
+	applySvc := NewApplyService(&fakeApplier{}, sink)
+	svc := NewServiceWriteService(&fakeServiceBaseBuilder{}, getter, deleter, applySvc, "default")
 	return svc, sink
 }
 
@@ -550,5 +562,368 @@ func TestServiceUpdateNotFoundPropagates(t *testing.T) {
 	var nf *NotFoundError
 	if !errors.As(err, &nf) {
 		t.Fatalf("Update error = %v, want *NotFoundError", err)
+	}
+}
+
+// --- serviceServingReason tests (Decision Gate 4) ----------------------------
+
+// serviceStatus wraps a status map into a MergedSpec the reason reader accepts.
+func serviceStatus(status map[string]any) MergedSpec {
+	return MergedSpec{"status": status}
+}
+
+// cond builds one status condition entry.
+func cond(condType, status string) map[string]any {
+	return map[string]any{"type": condType, "status": status}
+}
+
+func TestServiceServingReason(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		status    map[string]any
+		wantEmpty bool
+	}{
+		{
+			name:      "no status",
+			status:    nil,
+			wantEmpty: true,
+		},
+		{
+			name:      "zero endpoints, no rollout",
+			status:    map[string]any{"numServeEndpoints": int64(0)},
+			wantEmpty: true,
+		},
+		{
+			name:      "endpoints present",
+			status:    map[string]any{"numServeEndpoints": int64(3)},
+			wantEmpty: false,
+		},
+		{
+			name:      "endpoints as float64 (unstructured JSON number)",
+			status:    map[string]any{"numServeEndpoints": float64(2)},
+			wantEmpty: false,
+		},
+		{
+			name:      "upgrade in progress",
+			status:    map[string]any{"conditions": []any{cond("UpgradeInProgress", "True")}},
+			wantEmpty: false,
+		},
+		{
+			name:      "rollback in progress",
+			status:    map[string]any{"conditions": []any{cond("RollbackInProgress", "True")}},
+			wantEmpty: false,
+		},
+		{
+			// Ready alone must NOT trigger: Ready==False during a rollback while the old
+			// cluster serves, and here Ready==True but no endpoints/rollout is a boot race.
+			name:      "ready condition true is not itself a serving signal",
+			status:    map[string]any{"conditions": []any{cond("RayServiceReady", "True")}},
+			wantEmpty: true,
+		},
+		{
+			name:      "upgrade condition present but False",
+			status:    map[string]any{"conditions": []any{cond("UpgradeInProgress", "False")}},
+			wantEmpty: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := serviceServingReason(serviceStatus(tt.status))
+			if tt.wantEmpty && got != "" {
+				t.Errorf("serviceServingReason = %q, want empty", got)
+			}
+			if !tt.wantEmpty && got == "" {
+				t.Error("serviceServingReason = empty, want a non-empty reason")
+			}
+		})
+	}
+}
+
+// --- ServiceWriteService.Delete tests ----------------------------------------
+
+// seededService builds a ServiceDetail with metadata.uid (for a non-trivial
+// fingerprint) and an optional status block, optionally protected. Mirrors
+// seededCluster on the cluster side.
+func seededService(namespace, name, uid string, protected bool, status map[string]any) ServiceDetail {
+	meta := map[string]any{"name": name, "namespace": namespace, "uid": uid}
+	if protected {
+		meta["annotations"] = map[string]any{ProtectedAnnotation: "true"}
+	}
+	raw := MergedSpec{
+		"apiVersion": "ray.io/v1",
+		"kind":       "RayService",
+		"metadata":   meta,
+		"spec":       map[string]any{"serveConfigV2": "cfg"},
+	}
+	if status != nil {
+		raw["status"] = status
+	}
+	return ServiceDetail{ServiceSummary: ServiceSummary{Name: name, Namespace: namespace}, Raw: raw}
+}
+
+// TestServiceDeletePreviewReturnsFingerprint: an empty confirm on an idle service
+// returns the identity-only delete fingerprint and records no delete.
+func TestServiceDeletePreviewReturnsFingerprint(t *testing.T) {
+	t.Parallel()
+	detail := seededService("default", "svc", "uid-1", false, nil)
+	deleter := &fakeDeleter{}
+	svc, _ := newServiceDeleteService(detail, deleter)
+
+	err := svc.Delete(context.Background(), ServiceDeleteParams{Name: "svc"})
+	var required *ConfirmRequiredError
+	if !errors.As(err, &required) {
+		t.Fatalf("Delete error = %v, want *ConfirmRequiredError", err)
+	}
+	if want := Fingerprint(detail.Raw, OpDelete); required.Fingerprint != want {
+		t.Errorf("fingerprint = %q, want %q", required.Fingerprint, want)
+	}
+	if len(deleter.calls) != 0 {
+		t.Errorf("deleter called %d times, want 0 (preview only)", len(deleter.calls))
+	}
+}
+
+// TestServiceDeleteCommitWithMatchingConfirm: a matching confirm deletes the
+// RayService (KindRayService) at the right identity.
+func TestServiceDeleteCommitWithMatchingConfirm(t *testing.T) {
+	t.Parallel()
+	detail := seededService("default", "svc", "uid-1", false, nil)
+	deleter := &fakeDeleter{}
+	svc, _ := newServiceDeleteService(detail, deleter)
+
+	fp := Fingerprint(detail.Raw, OpDelete)
+	if err := svc.Delete(context.Background(), ServiceDeleteParams{Name: "svc", Confirm: fp}); err != nil {
+		t.Fatalf("Delete with matching confirm: %v", err)
+	}
+	if len(deleter.calls) != 1 {
+		t.Fatalf("deleter calls = %d, want 1", len(deleter.calls))
+	}
+	c := deleter.calls[0]
+	if c.kind != KindRayService || c.namespace != "default" || c.name != "svc" {
+		t.Errorf("delete target = %s %s/%s, want RayService default/svc", c.kind, c.namespace, c.name)
+	}
+}
+
+// TestServiceDeleteMismatchRejected: a wrong confirm is a ConfirmMismatchError.
+func TestServiceDeleteMismatchRejected(t *testing.T) {
+	t.Parallel()
+	detail := seededService("default", "svc", "uid-1", false, nil)
+	deleter := &fakeDeleter{}
+	svc, _ := newServiceDeleteService(detail, deleter)
+
+	err := svc.Delete(context.Background(), ServiceDeleteParams{Name: "svc", Confirm: "wrong"})
+	var mismatch *ConfirmMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("Delete error = %v, want *ConfirmMismatchError", err)
+	}
+	if len(deleter.calls) != 0 {
+		t.Errorf("deleter called %d times, want 0", len(deleter.calls))
+	}
+}
+
+// TestServiceDeleteProtectedRefused: a protected service refuses both preview and
+// commit, and never yields a fingerprint (protected check precedes confirm).
+func TestServiceDeleteProtectedRefused(t *testing.T) {
+	t.Parallel()
+	detail := seededService("default", "svc", "uid-2", true, nil)
+	deleter := &fakeDeleter{}
+	svc, _ := newServiceDeleteService(detail, deleter)
+
+	err := svc.Delete(context.Background(), ServiceDeleteParams{Name: "svc"})
+	if err == nil {
+		t.Fatal("Delete (preview) on protected service returned nil, want error")
+	}
+	var required *ConfirmRequiredError
+	if errors.As(err, &required) {
+		t.Fatal("protected service returned a ConfirmRequiredError; the protected check must precede confirm")
+	}
+	var serving *ServingRefusedError
+	if errors.As(err, &serving) {
+		t.Fatal("protected service returned a ServingRefusedError; the protected check must precede the serving guard")
+	}
+
+	fp := Fingerprint(detail.Raw, OpDelete)
+	if err := svc.Delete(context.Background(), ServiceDeleteParams{Name: "svc", Confirm: fp}); err == nil {
+		t.Fatal("Delete (commit) on protected service returned nil, want error")
+	}
+	if len(deleter.calls) != 0 {
+		t.Errorf("deleter called %d times, want 0 (protected refused)", len(deleter.calls))
+	}
+}
+
+// TestServiceDeleteProtectedBeatsServing: a service that is BOTH protected and
+// serving refuses with the protected message (protected precedes the serving guard),
+// even without force.
+func TestServiceDeleteProtectedBeatsServing(t *testing.T) {
+	t.Parallel()
+	detail := seededService("default", "svc", "uid-2b", true, map[string]any{"numServeEndpoints": int64(4)})
+	deleter := &fakeDeleter{}
+	svc, _ := newServiceDeleteService(detail, deleter)
+
+	err := svc.Delete(context.Background(), ServiceDeleteParams{Name: "svc"})
+	var serving *ServingRefusedError
+	if errors.As(err, &serving) {
+		t.Fatal("protected+serving service returned ServingRefusedError; protected must win")
+	}
+	if err == nil {
+		t.Fatal("Delete returned nil, want the protected refusal")
+	}
+}
+
+// TestServiceDeleteServingRefusedWithoutForce: a serving service (endpoints>0)
+// refuses at PREVIEW with a ServingRefusedError, before minting a fingerprint.
+func TestServiceDeleteServingRefusedWithoutForce(t *testing.T) {
+	t.Parallel()
+	detail := seededService("default", "svc", "uid-3", false, map[string]any{"numServeEndpoints": int64(2)})
+	deleter := &fakeDeleter{}
+	svc, _ := newServiceDeleteService(detail, deleter)
+
+	err := svc.Delete(context.Background(), ServiceDeleteParams{Name: "svc"})
+	var serving *ServingRefusedError
+	if !errors.As(err, &serving) {
+		t.Fatalf("Delete error = %v, want *ServingRefusedError", err)
+	}
+	// The serving guard precedes the confirm gate: no fingerprint is minted.
+	var required *ConfirmRequiredError
+	if errors.As(err, &required) {
+		t.Fatal("serving service returned a ConfirmRequiredError; the serving guard must precede confirm")
+	}
+	if len(deleter.calls) != 0 {
+		t.Errorf("deleter called %d times, want 0 (serving refused)", len(deleter.calls))
+	}
+}
+
+// TestServiceDeleteForceOverridesServing: force=true bypasses the serving guard but
+// STILL requires confirm — a force preview returns a fingerprint (not a delete), and
+// the matching confirm then commits.
+func TestServiceDeleteForceOverridesServing(t *testing.T) {
+	t.Parallel()
+	detail := seededService("default", "svc", "uid-4", false, map[string]any{"numServeEndpoints": int64(2)})
+	deleter := &fakeDeleter{}
+	svc, _ := newServiceDeleteService(detail, deleter)
+
+	// force + empty confirm → still a preview (force does not skip confirm).
+	err := svc.Delete(context.Background(), ServiceDeleteParams{Name: "svc", Force: true})
+	var required *ConfirmRequiredError
+	if !errors.As(err, &required) {
+		t.Fatalf("Delete(force, no confirm) error = %v, want *ConfirmRequiredError", err)
+	}
+	if len(deleter.calls) != 0 {
+		t.Errorf("deleter called %d times on force preview, want 0", len(deleter.calls))
+	}
+
+	// force + matching confirm → commit.
+	if err := svc.Delete(context.Background(), ServiceDeleteParams{Name: "svc", Force: true, Confirm: required.Fingerprint}); err != nil {
+		t.Fatalf("Delete(force, confirm): %v", err)
+	}
+	if len(deleter.calls) != 1 {
+		t.Fatalf("deleter calls = %d, want 1 after force+confirm", len(deleter.calls))
+	}
+}
+
+// TestServiceDeleteRolloutRefusedWithoutForce: an in-flight upgrade (endpoints may
+// read 0) still refuses without force — deleting mid-rollout tears down both clusters.
+func TestServiceDeleteRolloutRefusedWithoutForce(t *testing.T) {
+	t.Parallel()
+	status := map[string]any{
+		"numServeEndpoints": int64(0),
+		"conditions":        []any{cond("UpgradeInProgress", "True")},
+	}
+	detail := seededService("default", "svc", "uid-5", false, status)
+	deleter := &fakeDeleter{}
+	svc, _ := newServiceDeleteService(detail, deleter)
+
+	err := svc.Delete(context.Background(), ServiceDeleteParams{Name: "svc"})
+	var serving *ServingRefusedError
+	if !errors.As(err, &serving) {
+		t.Fatalf("Delete error = %v, want *ServingRefusedError for an in-flight upgrade", err)
+	}
+}
+
+// TestServiceDeleteDryRunPassesThrough: a matching confirm with DryRun=true passes
+// the flag to the Deleter.
+func TestServiceDeleteDryRunPassesThrough(t *testing.T) {
+	t.Parallel()
+	detail := seededService("default", "svc", "uid-6", false, nil)
+	deleter := &fakeDeleter{}
+	svc, _ := newServiceDeleteService(detail, deleter)
+
+	fp := Fingerprint(detail.Raw, OpDelete)
+	if err := svc.Delete(context.Background(), ServiceDeleteParams{Name: "svc", Confirm: fp, DryRun: true}); err != nil {
+		t.Fatalf("Delete(dryRun): %v", err)
+	}
+	if len(deleter.calls) != 1 || !deleter.calls[0].dryRun {
+		t.Fatalf("deleter calls = %+v, want one call with dryRun=true", deleter.calls)
+	}
+}
+
+// TestServiceDeleteNotFoundPropagates: a missing service propagates NotFoundError
+// and records no delete.
+func TestServiceDeleteNotFoundPropagates(t *testing.T) {
+	t.Parallel()
+	getter := &fakeServiceGetter{err: &NotFoundError{Kind: KindRayService, Namespace: "default", Name: "gone"}}
+	sink := &recordingSink{}
+	deleter := &fakeDeleter{}
+	svc := NewServiceWriteService(&fakeServiceBaseBuilder{}, getter, deleter, NewApplyService(&fakeApplier{}, sink), "default")
+
+	err := svc.Delete(context.Background(), ServiceDeleteParams{Name: "gone"})
+	var nf *NotFoundError
+	if !errors.As(err, &nf) {
+		t.Fatalf("Delete error = %v, want *NotFoundError", err)
+	}
+	if len(deleter.calls) != 0 {
+		t.Errorf("deleter called %d times, want 0 (not found)", len(deleter.calls))
+	}
+}
+
+// TestServiceDeleteAuditEmitted: exactly one audit record on commit (success and
+// failure), tagged ray_service_delete.
+func TestServiceDeleteAuditEmitted(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success", func(t *testing.T) {
+		t.Parallel()
+		detail := seededService("default", "svc", "uid-audit", false, nil)
+		deleter := &fakeDeleter{}
+		svc, sink := newServiceDeleteService(detail, deleter)
+
+		fp := Fingerprint(detail.Raw, OpDelete)
+		if err := svc.Delete(context.Background(), ServiceDeleteParams{Name: "svc", Confirm: fp}); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if len(sink.records) != 1 {
+			t.Fatalf("audit records = %d, want 1", len(sink.records))
+		}
+		rec := sink.records[0]
+		if rec.Tool != "ray_service_delete" || rec.Kind != KindRayService || rec.Outcome != AuditOutcomeSuccess {
+			t.Errorf("audit rec = %+v, want ray_service_delete/RayService/success", rec)
+		}
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		t.Parallel()
+		detail := seededService("default", "svc", "uid-audit-fail", false, nil)
+		deleter := &fakeDeleter{err: errors.New("kube error")}
+		svc, sink := newServiceDeleteService(detail, deleter)
+
+		fp := Fingerprint(detail.Raw, OpDelete)
+		if err := svc.Delete(context.Background(), ServiceDeleteParams{Name: "svc", Confirm: fp}); err == nil {
+			t.Fatal("Delete returned nil, want the deleter error")
+		}
+		if len(sink.records) != 1 || sink.records[0].Outcome != AuditOutcomeFailure {
+			t.Fatalf("audit records = %+v, want one failure", sink.records)
+		}
+	})
+}
+
+// TestServiceDeleteRequiresName: an empty name is rejected before any read.
+func TestServiceDeleteRequiresName(t *testing.T) {
+	t.Parallel()
+	deleter := &fakeDeleter{}
+	svc, _ := newServiceDeleteService(seededService("default", "svc", "uid-x", false, nil), deleter)
+
+	if err := svc.Delete(context.Background(), ServiceDeleteParams{}); err == nil {
+		t.Fatal("Delete with empty name returned nil, want a validation error")
 	}
 }

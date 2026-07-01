@@ -321,3 +321,197 @@ func TestServiceUpdateReturnsPredicatedPath(t *testing.T) {
 	}
 	assertHasText(t, res)
 }
+
+// --- ray_service_delete MCP tests (Task 22) ----------------------------------
+
+// seededServiceKube returns a fakeKubeRay seeded with one RayService carrying a
+// metadata.uid (for a non-trivial fingerprint), an optional status block (serving
+// signals), and an optional protected annotation.
+func seededServiceKube(namespace, name, uid string, protected bool, status map[string]any) *fakeKubeRay {
+	meta := map[string]any{"name": name, "namespace": namespace, "uid": uid}
+	if protected {
+		meta["annotations"] = map[string]any{domain.ProtectedAnnotation: "true"}
+	}
+	raw := domain.MergedSpec{
+		"apiVersion": "ray.io/v1",
+		"kind":       "RayService",
+		"metadata":   meta,
+		"spec":       map[string]any{"serveConfigV2": "cfg"},
+	}
+	if status != nil {
+		raw["status"] = status
+	}
+	return &fakeKubeRay{
+		services: map[string]domain.ServiceDetail{
+			namespace + "/" + name: {
+				ServiceSummary: domain.ServiceSummary{Name: name, Namespace: namespace},
+				Raw:            raw,
+			},
+		},
+	}
+}
+
+// TestServiceDeleteAbsentWithoutDestructive asserts the delete tool is NOT
+// advertised when --allow-destructive is false (even with --allow-mutations).
+func TestServiceDeleteAbsentWithoutDestructive(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "default", AllowMutations: true, AllowDestructive: false, AllowRawSpec: true}
+	session := connectWriteWithRead(t, cfg, &fakeWriteBackend{}, seededServiceKube("default", "svc", "uid-1", false, nil))
+	if _, ok := toolNames(t, session)["ray_service_delete"]; ok {
+		t.Error("ray_service_delete advertised without --allow-destructive; it must be absent")
+	}
+}
+
+// TestServiceDeletePresentWithDestructive asserts the tool is advertised with both
+// flags and carries DestructiveHint=true, IdempotentHint=true.
+func TestServiceDeletePresentWithDestructive(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "default", AllowMutations: true, AllowDestructive: true, AllowRawSpec: true}
+	session := connectWriteWithRead(t, cfg, &fakeWriteBackend{}, seededServiceKube("default", "svc", "uid-1", false, nil))
+
+	tool, ok := toolNames(t, session)["ray_service_delete"]
+	if !ok {
+		t.Fatal("ray_service_delete absent with --allow-destructive; it must be advertised")
+	}
+	if tool.Annotations == nil || tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint {
+		t.Error("ray_service_delete DestructiveHint should be true")
+	}
+	if tool.Annotations == nil || !tool.Annotations.IdempotentHint {
+		t.Error("ray_service_delete IdempotentHint should be true")
+	}
+}
+
+// TestServiceDeletePreviewRendersFingerprint drives a preview (empty confirm) on an
+// idle service and asserts it is NOT a tool error and carries the fingerprint.
+func TestServiceDeletePreviewRendersFingerprint(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "default", AllowMutations: true, AllowDestructive: true, AllowRawSpec: true}
+	backend := &fakeWriteBackend{}
+	session := connectWriteWithRead(t, cfg, backend, seededServiceKube("default", "svc", "uid-1", false, nil))
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_service_delete",
+		Arguments: map[string]any{"name": "svc"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("preview reported a tool error: %s", textContent(res))
+	}
+	sc, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("StructuredContent is %T, want map[string]any", res.StructuredContent)
+	}
+	confirm, _ := sc["confirm"].(string)
+	if confirm == "" {
+		t.Fatal("preview structured output has no confirm fingerprint")
+	}
+	if len(backend.deleteCalls) != 0 {
+		t.Errorf("preview recorded a delete (%d), want 0", len(backend.deleteCalls))
+	}
+	assertHasText(t, res)
+}
+
+// TestServiceDeleteServingRefusedIsError asserts a serving service (endpoints>0) is
+// a tool error whose message points at force, and mints no fingerprint / no delete.
+func TestServiceDeleteServingRefusedIsError(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "default", AllowMutations: true, AllowDestructive: true, AllowRawSpec: true}
+	backend := &fakeWriteBackend{}
+	kube := seededServiceKube("default", "svc", "uid-2", false, map[string]any{"numServeEndpoints": int64(3)})
+	session := connectWriteWithRead(t, cfg, backend, kube)
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_service_delete",
+		Arguments: map[string]any{"name": "svc"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("serving service delete did not error; it must be refused without force")
+	}
+	if !containsAll(textContent(res), "force", "serving") {
+		t.Errorf("refusal message %q should mention force + serving", textContent(res))
+	}
+	if len(backend.deleteCalls) != 0 {
+		t.Errorf("serving refusal recorded a delete (%d), want 0", len(backend.deleteCalls))
+	}
+}
+
+// TestServiceDeleteForceCommitEndToEnd asserts force overrides the serving guard but
+// still requires confirm: a force preview yields a fingerprint (no delete), and the
+// force+confirm commit records exactly one RayService delete.
+func TestServiceDeleteForceCommitEndToEnd(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "default", AllowMutations: true, AllowDestructive: true, AllowRawSpec: true}
+	backend := &fakeWriteBackend{}
+	kube := seededServiceKube("default", "svc", "uid-3", false, map[string]any{"numServeEndpoints": int64(2)})
+	session := connectWriteWithRead(t, cfg, backend, kube)
+
+	// force + no confirm → preview (still requires confirm).
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_service_delete",
+		Arguments: map[string]any{"name": "svc", "force": true},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(force preview): %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("force preview reported a tool error: %s", textContent(res))
+	}
+	sc, _ := res.StructuredContent.(map[string]any)
+	confirm, _ := sc["confirm"].(string)
+	if confirm == "" {
+		t.Fatal("force preview yielded no fingerprint")
+	}
+	if len(backend.deleteCalls) != 0 {
+		t.Errorf("force preview recorded a delete (%d), want 0", len(backend.deleteCalls))
+	}
+
+	// force + confirm → commit.
+	res, err = session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_service_delete",
+		Arguments: map[string]any{"name": "svc", "force": true, "confirm": confirm},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(force commit): %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("force commit reported a tool error: %s", textContent(res))
+	}
+	if len(backend.deleteCalls) != 1 {
+		t.Fatalf("delete calls = %d, want 1 (force commit)", len(backend.deleteCalls))
+	}
+	if backend.deleteCalls[0].kind != domain.KindRayService {
+		t.Errorf("delete kind = %s, want RayService", backend.deleteCalls[0].kind)
+	}
+}
+
+// TestServiceDeleteProtectedIsError asserts a protected service yields a tool error
+// mentioning "protected" and records no delete.
+func TestServiceDeleteProtectedIsError(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DefaultNamespace: "default", AllowMutations: true, AllowDestructive: true, AllowRawSpec: true}
+	backend := &fakeWriteBackend{}
+	kube := seededServiceKube("default", "svc", "uid-4", true, nil)
+	session := connectWriteWithRead(t, cfg, backend, kube)
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ray_service_delete",
+		Arguments: map[string]any{"name": "svc"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("protected service delete did not error")
+	}
+	if !containsAll(textContent(res), "protected") {
+		t.Errorf("error message %q does not mention 'protected'", textContent(res))
+	}
+	if len(backend.deleteCalls) != 0 {
+		t.Errorf("protected refusal recorded a delete (%d), want 0", len(backend.deleteCalls))
+	}
+}

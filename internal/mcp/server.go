@@ -82,13 +82,15 @@ func NewServer(cfg *config.Config, src capabilitiesSource, kube domain.ClusterRe
 		jobWriteSvc := domain.NewJobWriteService(write, write, write, applySvc, cfg.DefaultNamespace)
 		addJobWriteTools(server, jobWriteSvc, cfg.AllowRawSpec, cfg.AllowDestructive)
 
-		// RayService writes (Task 21): deploy + update. The adapter is also the
-		// ServiceBaseBuilder; the ServiceGetter (for update's read-modify-apply, the
-		// narrow read slice that path needs) is satisfied by the read backend (kube)
-		// when it implements it — same "advertise only when wired" gate as the reads.
+		// RayService writes (Task 21/22): deploy + update + delete. The adapter is
+		// also the ServiceBaseBuilder and the Deleter; the ServiceGetter (for update's
+		// read-modify-apply and delete's guards, the narrow read slice those paths
+		// need) is satisfied by the read backend (kube) when it implements it — same
+		// "advertise only when wired" gate as the reads. Delete additionally gates on
+		// the destructive tier (it cascades to the owned cluster).
 		if svcGetter, ok := kube.(domain.ServiceGetter); ok {
-			svcWriteSvc := domain.NewServiceWriteService(write, svcGetter, applySvc, cfg.DefaultNamespace)
-			addServiceWriteTools(server, svcWriteSvc, cfg.AllowRawSpec)
+			svcWriteSvc := domain.NewServiceWriteService(write, svcGetter, write, applySvc, cfg.DefaultNamespace)
+			addServiceWriteTools(server, svcWriteSvc, cfg.AllowRawSpec, cfg.AllowDestructive)
 		}
 	}
 
