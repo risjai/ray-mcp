@@ -5,9 +5,9 @@
 // reaches Ray's dashboard/job API read-only for the runtime detail the CRDs do
 // not expose (the cross-plane "wedge").
 //
-// Task 4 wires the walking skeleton: config -> minimal kuberay adapter -> MCP
-// server (one read-only meta tool) -> stdio transport. Under stdio, stdout is
-// the JSON-RPC wire, so all diagnostics go to stderr.
+// main wires the process: config -> kuberay adapter + wedge backend -> MCP
+// server -> the configured transport (stdio or streamable HTTP). Under stdio,
+// stdout is the JSON-RPC wire, so all diagnostics go to stderr.
 package main
 
 import (
@@ -17,6 +17,8 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/risjai/ray-mcp/internal/adapters/kuberay"
 	"github.com/risjai/ray-mcp/internal/adapters/rayapi"
@@ -41,11 +43,6 @@ func run() int {
 
 	// Logger is bound to stderr so it never corrupts the stdout JSON-RPC wire.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel(cfg.LogLevel)}))
-
-	if cfg.Transport != "stdio" {
-		logger.Error("transport not yet implemented", "transport", cfg.Transport)
-		return 1
-	}
 
 	// Build the adapter WITHOUT dialing: the controller-runtime client is built
 	// lazily on the first ray_cluster_* call. This lets the server always boot —
@@ -73,11 +70,23 @@ func run() int {
 	defer stop()
 
 	logger.Info("starting ray-mcp", "transport", cfg.Transport, "defaultNamespace", cfg.DefaultNamespace)
-	if err := transport.RunStdio(ctx, server); err != nil {
+	if err := runTransport(ctx, cfg, server); err != nil {
 		logger.Error("server exited with error", "err", err)
 		return 1
 	}
 	return 0
+}
+
+// runTransport dispatches to the configured transport. config.Load has already
+// validated cfg.Transport, so the default arm is unreachable in practice; it
+// stays as a defensive guard.
+func runTransport(ctx context.Context, cfg *config.Config, server *mcp.Server) error {
+	switch cfg.Transport {
+	case "http":
+		return transport.RunHTTP(ctx, cfg, server)
+	default:
+		return transport.RunStdio(ctx, server)
+	}
 }
 
 // buildWedge assembles the cross-plane "wedge" backend for the RayJob read tools

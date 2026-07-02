@@ -154,7 +154,8 @@ Needs Docker + kubectl + Go + Claude Code; ~20–30 min; fully disposable.
 | RayService read — `ray_service_list` / `ray_service_get` (distilled rollout phase + serve health) | ✅ Shipped |
 | RayService writes — `ray_service_deploy` / `ray_service_update` (SSA, dry-run, diffs; update predicts the operator's reconfig path: in-place / zero-downtime-swap / scale) | ✅ Shipped (`--allow-mutations`) |
 | RayService delete — `ray_service_delete` (destructive tier, two-step confirm-fingerprint, `protected` guard, refuses a serving service unless `force=true`; always cascades to the owned cluster) | ✅ Shipped (`--allow-destructive`) |
-| Streamable HTTP transport + auth (static bearer / TokenReview) | 📋 Planned |
+| Streamable HTTP transport + static bearer auth (`--transport http`, mandatory token on any non-loopback bind) | ✅ Shipped |
+| HTTP auth — TokenReview mode (K8s SA tokens) + caller identity in the audit log | 📋 Planned |
 | Read-only RBAC floor — ServiceAccount + ClusterRole ([`deploy/rbac/`](deploy/rbac/)) | ✅ Shipped (read-only) |
 | Helm chart + in-cluster Deployment | 📋 Planned |
 | Prebuilt binaries + Homebrew (GoReleaser) | 📋 Planned |

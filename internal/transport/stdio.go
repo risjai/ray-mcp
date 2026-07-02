@@ -1,7 +1,7 @@
-// Package transport runs an MCP server over a chosen transport. For Task 4 only
-// stdio is wired (HTTP arrives in a later task). Under stdio, stdout IS the
-// JSON-RPC wire — the transport writes protocol frames there — so all logging
-// and diagnostics must go to stderr or a file, never stdout.
+// Package transport runs an MCP server over a chosen transport: stdio (primary)
+// or streamable HTTP (with auth). Under stdio, stdout IS the JSON-RPC wire — the
+// transport writes protocol frames there — so all logging and diagnostics must
+// go to stderr or a file, never stdout.
 package transport
 
 import (
